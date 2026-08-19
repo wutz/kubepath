@@ -1,0 +1,11 @@
+name = "kubepath"
+compatibility_date = "2026-06-03"
+compatibility_flags = ["nodejs_compat"]
+main = "@tanstack/react-start/server-entry"
+
+routes = [
+  { pattern = "kubepath.wutz.dev", custom_domain = true }
+]
+
+[observability]
+enabled = true

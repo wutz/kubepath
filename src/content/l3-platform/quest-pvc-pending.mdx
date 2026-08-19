@@ -1,0 +1,188 @@
+现场是这样的：业务方说新上的服务起不来，Pod 卡了十分钟。你 `kubectl get pod` 一看，`ContainerCreating`；再看 PVC，`Pending`。
+
+这一关的目标不是记住答案，而是练**顺序**：先看现象，再让集群自己说话，最后才去猜后端。绝大多数人在这类故障上浪费时间，是因为第一步就跳去登存储节点了。
+
+## 开始之前：先想清楚在哪一侧
+
+上一节的分界线在这里要用上：
+
+- **PVC `Pending`** → 卷还没被创建出来 → 看 **controller** 侧的 provisioner
+- **PVC `Bound`，Pod `ContainerCreating`** → 卷有了但挂不上 → 看**那台节点**的 node plugin
+
+这一关是前者。所以整场排查都不需要登任何一台计算节点。
+
+<Terminal
+  id="pvc-pending"
+  host="root@mn-10-128-0-1"
+  intro={`模拟终端：default 命名空间下的 data-pvc 已经 Pending 十分钟，业务 Pod 起不来。
+输入 goals 看目标，hint 要提示，help 看用法。`}
+  commands={[
+    {
+      cmd: 'kubectl get pvc',
+      goal: '确认 PVC 的状态和它请求的 StorageClass',
+      hint: '第一步永远是看现象：什么状态、用的哪个 SC。',
+      output: `NAME       STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+data-pvc   Pending                                                 block-ceph     10m`,
+    },
+    {
+      cmd: 'kubectl describe pvc data-pvc',
+      goal: '看 Events，让集群直接告诉你卡在哪',
+      hint: 'describe 的 Events 段落是排查 Pending 的第一手信息，别跳过它去猜。',
+      output: `Name:          data-pvc
+Namespace:     default
+StorageClass:  block-ceph
+Status:        Pending
+Capacity:
+Access Modes:
+Events:
+  Type     Reason                Age                 From                         Message
+  ----     ------                ----                ----                         -------
+  Normal   ExternalProvisioning  10m (x41 over 10m)  persistentvolume-controller  Waiting for a volume to be created by external provisioner "rbd.csi.ceph.com"
+  Warning  ProvisioningFailed    9m (x8 over 10m)    rbd.csi.ceph.com_csi-rbdplugin-provisioner-7d9f8b6c4-xk2mn
+           failed to provision volume with StorageClass "block-ceph": rpc error: code = Internal desc = failed to get connection: connecting failed: rados: ret=-13, Permission denied`,
+    },
+    {
+      cmd: 'kubectl logs deploy/csi-rbdplugin-provisioner -c csi-provisioner --tail=5',
+      goal: '到 provisioner 日志里确认报错反复出现，不是偶发',
+      hint: '卷创建失败看 controller 侧的 csi-provisioner 容器。',
+      output: `I0813 10:12:03.412  Waiting for volume to be created...
+E0813 10:12:04.882  failed to provision volume: rados: ret=-13, Permission denied
+E0813 10:12:04.883  error syncing claim "default/data-pvc": failed to provision volume
+E0813 10:13:09.115  failed to provision volume: rados: ret=-13, Permission denied
+E0813 10:15:18.402  failed to provision volume: rados: ret=-13, Permission denied`,
+    },
+    {
+      cmd: 'kubectl get sc block-ceph -o yaml',
+      goal: '看 StorageClass 里配的池名与 secret',
+      hint: '报错是权限拒绝 —— 先看 SC 声明了要往哪个池写、用哪个 secret。',
+      output: `apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: block-ceph
+provisioner: rbd.csi.ceph.com
+parameters:
+  clusterID: 8d2f1c3a-7b41-4c9e-9f2a-5c6d8e0a1b23
+  pool: rbd
+  imageFeatures: layering
+  csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: default
+reclaimPolicy: Delete
+allowVolumeExpansion: true`,
+    },
+    {
+      cmd: 'kubectl get secret csi-rbd-secret -o jsonpath={.data.userID}',
+      goal: '确认 CSI 用的是哪个存储侧用户',
+      hint: 'Permission denied 的两个来源：凭据不对，或者这个用户的权限范围不对。先确认用户名。',
+      output: `a3ViZXJuZXRlcw==
+
+# base64 -d → kubernetes`,
+    },
+    {
+      cmd: 'ceph auth get client.kubernetes',
+      goal: '在存储侧核对这个用户的权限范围，定位根因',
+      hint: '用户名有了，去存储侧看它到底被授权访问哪个池 —— 和 SC 里的 pool 对一下。',
+      output: `[client.kubernetes]
+        key = AQBxxxxxxxxxxxxxxxxxxxxxxxxxx==
+        caps mgr = "profile rbd pool=rbd"
+        caps mon = "profile rbd"
+        caps osd = "profile rbd pool=kube"
+
+# 注意 osd 的 caps 限定的是 pool=kube
+# 而 StorageClass 里写的 pool 是 rbd —— 权限与目标池不匹配`,
+    },
+    {
+      cmd: 'ceph -s',
+      output: `  cluster:
+    health: HEALTH_OK
+  services:
+    mon: 3 daemons, quorum sn-10-128-201-1,sn-10-128-201-2,sn-10-128-201-3
+    osd: 36 osds: 36 up, 36 in
+  data:
+    pgs: 673 active+clean
+
+# 存储集群本身完全健康 —— 问题在接入配置，不在存储侧`,
+    },
+    {
+      cmd: 'kubectl get pod',
+      output: `NAME                   READY   STATUS              RESTARTS   AGE
+app-7d9f8b6c4-x2krn    0/1     ContainerCreating   0          10m
+
+# Pod 是被 PVC 拖住的，本身没有问题`,
+    },
+    {
+      cmd: 'kubectl get pv',
+      output: `No resources found
+
+# 一个 PV 都没有 —— 印证了卷从来没被创建出来`,
+    },
+  ]}
+/>
+
+## 根因与修复
+
+`client.kubernetes` 的 OSD 权限被限定在 `pool=kube`，而 StorageClass 里指定的池是 `rbd`。两边对不上，于是每次创建卷都被存储侧拒绝。
+
+修复方式二选一，取决于你想以哪边为准：
+
+```bash
+# 方式一：放开用户权限到 SC 声明的那个池
+ceph auth caps client.kubernetes \
+  mon 'profile rbd' \
+  osd 'profile rbd pool=rbd' \
+  mgr 'profile rbd pool=rbd'
+
+# 方式二：把 StorageClass 的 pool 改成 kube
+# 注意 SC 的 parameters 是不可变字段，要删掉重建
+```
+
+<Callout type="tip" title="改完之后不用重建 PVC">
+provisioner 会一直重试 —— 从 Events 里的 `x8 over 10m` 就能看出来。权限一放开，下一次重试就成功，PVC 自己会变成 Bound。
+
+这是 reconcile 模式给的便利：你只需要把环境改成对的，控制器会自己收敛。反过来说，如果改完十分钟还没动，那就说明你改的不是真正的原因。
+</Callout>
+
+## PVC Pending 排查清单
+
+按顺序走，绝大多数问题在前三步就定位了：
+
+| # | 检查项 | 命令 | 常见原因 |
+| --- | --- | --- | --- |
+| 1 | PVC 事件 | `kubectl describe pvc` | 信息最直接，永远先看这里 |
+| 2 | SC 存在吗 | `kubectl get sc` | 名字写错、SC 不存在、没有默认 SC |
+| 3 | provisioner 日志 | `kubectl logs <csi-controller>` | 权限、网络、参数错误 |
+| 4 | secret 是否正确 | `kubectl get secret -o yaml` | key 名错、namespace 错、内容过期 |
+| 5 | 后端是否健康 | `ceph -s` / `mmhealth` | 存储侧真的有问题 |
+| 6 | accessMode 支持吗 | 对比 SC 与 PVC | 块存储要了 RWX |
+| 7 | 容量与配额 | `ceph df` / `mmlsquota` | 后端没空间了 |
+| 8 | 拓扑约束 | `describe` 里的调度信息 | WaitForFirstConsumer + 无可用节点 |
+
+<Quiz
+  id="quest-pvc-1"
+  question="这一关里，为什么不需要登上业务 Pod 所在的那台计算节点？"
+  options={[
+    { text: 'PVC 还是 Pending，卷根本没创建出来，挂载阶段还没开始', correct: true },
+    { text: '因为 Pod 是 ContainerCreating 而不是 CrashLoopBackOff', feedback: '状态确实说明容器没起来，但判断依据不是这个 —— 是 PVC 还没 Bound。' },
+    { text: '因为 CSI node plugin 的日志也能在控制面看到', feedback: '能用 kubectl 拉到日志，但这一关根本不需要看 node plugin。' },
+    { text: '因为存储集群是 HEALTH_OK', feedback: '存储健康只排除了后端故障这一种可能，和该去哪一侧排查无关。' },
+  ]}
+  explain={<>PVC 的状态就是分界线：<code>Pending</code> 意味着 external-provisioner 还没能创建出卷，整件事都发生在 controller 侧；node plugin 要等 PV 出现、Pod 绑定之后才会被调用。搞清这条界线，能省掉一半的无效排查。</>}
+/>
+
+<Quiz
+  id="quest-pvc-2"
+  question="provisioner 报 Permission denied，而存储集群是 HEALTH_OK。最该往哪个方向查？"
+  options={[
+    { text: 'CSI 用的凭据，以及那个用户对目标池的权限范围', correct: true },
+    { text: '后端存储集群故障', feedback: 'HEALTH_OK 且能返回权限错误，说明连得上、只是没权限。' },
+    { text: 'K8s 节点资源不足', feedback: '资源不足体现在 Pod 调度失败（Pending 且无 nodeName），不是卷创建失败。' },
+    { text: '网络不通', feedback: '网络不通报的是连接超时，不是权限拒绝。错误信息本身就把这条排除了。' },
+  ]}
+  explain={<>Permission denied 只有两个常见来源：secret 里的 userID / key 不对，或者这个用户的 caps 限定的池与 StorageClass 的 <code>pool</code> 不一致。演练里是后者 —— 这是接入 ceph-csi 时最高频的配置错误，值得直接记住。</>}
+/>
+
+## 这一关的收获
+
+- **看现象 → 看事件 → 看控制器日志**，这个顺序对所有对象都成立，不只是 PVC
+- PVC 是 `Pending` 还是 `Bound`，直接决定你该去 controller 侧还是节点侧
+- 错误信息里的措辞很值钱：`Permission denied` 和 `connection timeout` 指向完全不同的方向
+- 存储集群 HEALTH_OK 不代表接入配置没问题 —— 大多数「存储故障」其实是接入配置错误

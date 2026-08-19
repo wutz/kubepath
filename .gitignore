@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# TanStack
+.tanstack/
+src/routeTree.gen.ts
+
+# Wrangler
+.wrangler/
+.dev.vars
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local

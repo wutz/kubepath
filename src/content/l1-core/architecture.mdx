@@ -1,0 +1,102 @@
+K8s 的所有排障，最后都会落到同一个问题上：**这个对象卡在哪一步了**。
+
+要回答它，你得先知道一次 `kubectl apply` 之后到底发生了什么。这一节把这条链路拆开，然后你会发现绝大多数故障现象都能直接映射到链路上的某一环。
+
+## 控制面与数据面
+
+先分清两拨人：
+
+```
+控制面（Control Plane）—— 做决定
+├─ kube-apiserver          唯一入口，所有读写都经过它
+├─ etcd                    唯一状态存储
+├─ kube-scheduler          决定 Pod 放在哪台节点
+└─ kube-controller-manager 一堆 reconcile 循环
+
+数据面（每个节点都有）—— 执行决定
+├─ kubelet                 把 Pod 变成节点上真实运行的容器
+├─ 容器运行时（containerd） 实际拉镜像、起容器
+└─ kube-proxy / CNI        实现 Service 与 Pod 网络
+```
+
+有一条约定贯穿整个设计：**组件之间从不直接通信，全部通过 apiserver**。调度器不会去问 kubelet 节点还剩多少内存，它读的是 apiserver 里的 Node 对象；kubelet 也不会主动联系调度器，它只是 watch 那些 `nodeName` 等于自己的 Pod。
+
+<Callout type="note" title="这条约定的意义">
+所有组件都是 apiserver 的客户端，彼此之间没有连线。这带来两个直接后果：
+
+1. **可以随便加组件** —— 你自己写的控制器和内置控制器地位完全平等，这就是 Operator 模式的基础
+2. **排障有唯一权威** —— `kubectl get -o yaml` 看到的就是所有组件看到的东西，不存在"某个组件有另一份状态"
+</Callout>
+
+## 一次 apply 的五步
+
+下面这个推演可以逐步走一遍。走完之后，试着点掉某个组件，看链路断在哪、现象是什么 —— 这正是你值班时会看到的东西。
+
+<ApplyFlow />
+
+## 组件挂掉时的影响面
+
+上面点出来的结论，整理成一张值班时能直接查的表：
+
+| 挂掉的组件 | 已有 Pod | 新建 / 变更 | 典型现象 |
+| --- | --- | --- | --- |
+| kube-apiserver | 继续运行 | 全部停摆 | kubectl 完全不可用，集群"冻结"在当前状态 |
+| etcd 失去 quorum | 继续运行 | 写入失败 | kubectl 读可能还行，写全部超时 |
+| controller-manager | 继续运行 | 对象创建了但没有下游 | Deployment 一直 0/3，节点故障后不重建 |
+| kube-scheduler | 继续运行 | Pod 停在 Pending | describe 里没有 Scheduled 事件 |
+| 单节点 kubelet | 该节点上的容器还在跑 | 该节点收不到新 Pod | 节点 5 分钟后 NotReady，Pod 在别处重建 |
+| kube-proxy | 容器在跑 | Service 转发不更新 | 新 Pod 起来了但流量进不去 |
+
+<Callout type="trap" title="控制面挂了，业务不一定挂">
+新人最常见的误判是把"kubectl 用不了"等同于"业务下线了"。
+
+实际上控制面全挂时，节点上已经在跑的容器不受任何影响，kube-proxy 里已有的转发规则也还在生效 —— 业务通常还是通的。真正丢的是**变更能力**：不能发布、不能扩容、节点坏了不会自愈。
+
+这个认知决定了你的处置优先级：先确认业务是否真的受影响，再决定要不要冒险做高风险恢复操作。
+</Callout>
+
+## 调度器只做一件事
+
+这一点值得单独强调，因为它反直觉：**调度器不启动任何容器**。
+
+它做的全部工作是给 Pod 的 `spec.nodeName` 填一个值。填完之后，那台节点上的 kubelet 自己会发现"这个 Pod 是我的"，然后开始干活。
+
+```bash
+# Pending 的 Pod，nodeName 是空的
+kubectl get pod web-0 -o jsonpath='{.spec.nodeName}'
+
+# 你甚至可以绕过调度器，手工指定节点（不推荐，但能说明问题）
+# spec.nodeName 一填，调度器就不管了，kubelet 直接接手
+```
+
+理解这一点，你就知道为什么 Pod 一直 Pending 时该去看调度器和节点资源，而 Pod 卡在 `ContainerCreating` 时该去看那台节点上的 kubelet 和运行时 —— 这两个状态之间的分界线，就是 `nodeName` 有没有被填上。
+
+<Quiz
+  id="arch-1"
+  question="一个 Pod 长时间处于 Pending 状态，nodeName 为空。以下哪些是合理的排查方向？"
+  options={[
+    { text: 'kubectl describe pod 看 Events 里调度器给的原因', correct: true },
+    { text: '登上目标节点看 kubelet 日志', feedback: 'nodeName 还是空的，说明还没轮到任何节点的 kubelet —— 现在没有「目标节点」。' },
+    { text: '检查集群是否有满足 requests 的可用节点', correct: true },
+    { text: '检查 Pod 的污点容忍与亲和性约束是否无法满足', correct: true },
+    { text: '看 containerd 是否正常', feedback: '运行时是 kubelet 接手之后的事，这时候还没到那一层。' },
+  ]}
+  explain={<>Pending + nodeName 为空 = 调度阶段的问题，看调度器的判断依据（资源、污点、亲和性）。等 nodeName 填上还起不来，才轮到节点侧的 kubelet 与运行时。</>}
+/>
+
+## 为什么 etcd 是唯一不能丢的东西
+
+集群里其它所有组件都是无状态的：apiserver 挂了重启一个，controller-manager 换台机器跑，节点坏了重装再 join。唯独 etcd 里的数据没有第二份。
+
+而 etcd 的写入路径有个硬性要求 —— Raft 协议要求每次提案都必须 fsync 落盘才能确认。这意味着**磁盘延迟直接决定了集群的写入延迟**。盘慢一点，表现出来就是 apiserver 超时、频繁选主、整个集群"发黏"。
+
+这条约束具体怎么验收，见 L0 阶段的《etcd 磁盘验收》—— 那是部署前唯一能独立测出来的硬指标。
+
+<Callout type="tip" title="记住这条排查顺序">
+遇到"集群整体变慢"，按这个顺序看，命中率最高：
+
+1. **etcd 的 WAL fsync p99** —— 磁盘是最常见的元凶
+2. **apiserver 请求延迟与在飞行的请求数** —— 有没有谁在疯狂 list
+3. **控制面节点的 CPU 与内存** —— apiserver 的对象缓存很吃内存
+4. 最后才是网络与业务侧
+</Callout>

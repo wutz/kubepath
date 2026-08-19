@@ -1,0 +1,114 @@
+"容器是轻量级虚拟机" —— 这个类比让人快速上手，也让人在排障时走错方向。
+
+虚拟机有自己的内核，容器没有。容器里的进程和宿主机上的进程跑在**同一个内核**上，只是被内核用两套机制圈了起来：namespace 管"能看见什么"，cgroup 管"能用多少"。
+
+理解这一句，后面很多现象就不奇怪了。
+
+## 容器就是被圈起来的进程
+
+在宿主机上，容器里的进程是能直接看到的：
+
+```bash
+# 找到某个 Pod 里容器的宿主机 PID
+crictl inspect <container-id> | grep -i pid
+
+# 这个 PID 在宿主机的进程树里就是一个普通进程
+ps -o pid,ppid,cmd -p <pid>
+
+# 它的 namespace 挂在这里
+ls -l /proc/<pid>/ns/
+```
+
+`/proc/<pid>/ns/` 下面每个链接就是一个 namespace。两个进程如果某个 namespace 的 inode 号相同，说明它们共享那个 namespace —— 这正是同一个 Pod 内多个容器能互相 `localhost` 访问的原因：**它们共享同一个 network namespace**。
+
+## 六种 namespace 各自隔离了什么
+
+| namespace | 隔离的东西 | 相关的现象 |
+| --- | --- | --- |
+| **mnt** | 挂载点 | 容器里的 `/` 是镜像层，看不到宿主机文件系统 |
+| **pid** | 进程编号 | 容器里的主进程是 PID 1，要负责收养僵尸进程 |
+| **net** | 网络栈 | 每个 Pod 一个独立 IP、独立 iptables、独立端口空间 |
+| **uts** | 主机名 | 容器里 `hostname` 返回 Pod 名 |
+| **ipc** | 共享内存、信号量 | 同 Pod 内容器可共享内存，跨 Pod 不行 |
+| **user** | UID/GID 映射 | 容器内的 root 可以映射成宿主机的普通用户 |
+
+<Callout type="trap" title="PID 1 的信号处理是个真坑">
+容器里的主进程是 PID 1，而 Linux 对 PID 1 有特殊待遇：**它不会执行默认的信号处理**。
+
+后果是，如果你的进程没有显式处理 `SIGTERM`，`kubectl delete pod` 发出的优雅终止信号会被直接忽略，然后等满 `terminationGracePeriodSeconds`（默认 30 秒）被 `SIGKILL` 强杀。表现就是"删 Pod 特别慢"、"重启总是要半分钟"。
+
+解决办法：进程里处理 SIGTERM，或者用 `tini` / `dumb-init` 之类的 init 包一层。
+</Callout>
+
+## cgroup：限制是怎么落到内核的
+
+namespace 决定看得见什么，cgroup 决定用得了多少。K8s 里 Pod 的 `requests` 与 `limits` 最终就是变成 cgroup 的几个文件：
+
+```bash
+# cgroup v2 下，某个容器的资源限制
+cd /sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/.../
+
+cat cpu.max        # limits.cpu → "200000 100000" 表示每 100ms 最多用 200ms CPU
+cat cpu.weight     # requests.cpu → 竞争时的权重
+cat memory.max     # limits.memory → 硬上限，超了就 OOMKill
+cat memory.high    # 软限制，超了开始加压回收
+```
+
+两个字段的性质完全不同，这个差别很关键：
+
+- **CPU 是可压缩资源**：超了就被限流（throttle），进程变慢但不死
+- **内存是不可压缩资源**：超了只能杀掉，就是 `OOMKilled`
+
+<Callout type="warn" title="CPU limits 设太小的代价">
+CPU 限流是按 100ms 周期硬切的。如果一个 Java 服务的 GC 或启动期需要短时间的高 CPU，而 `limits.cpu` 卡得很死，它会在每个周期被反复掐断 —— 表现是 P99 延迟毛刺、健康检查偶发超时，但 CPU 使用率看起来一点都不高。
+
+排查线索：看 cgroup 的 `cpu.stat` 里 `nr_throttled` 和 `throttled_usec`。这两个数在涨，就是被限流了。
+</Callout>
+
+## 镜像分层与写时复制
+
+镜像是一堆只读层叠起来的，容器启动时在最上面加一个可写层：
+
+```
+可写层（容器独有，删容器就没了）   ← 容器里所有的修改写在这
+─────────────────────────────
+只读层 3  应用代码
+只读层 2  依赖包
+只读层 1  基础镜像
+```
+
+OverlayFS 负责把这些层合并成容器看到的那个 `/`。修改一个来自只读层的文件时，会先把整个文件复制到可写层再改 —— 这就是写时复制（CoW）。
+
+两个直接后果：
+
+1. **同一节点上跑十个同镜像的容器，镜像只占一份空间** —— 这也是节点磁盘规划时容易算重复的地方
+2. **在容器里改大文件很贵** —— 改一个 1G 文件的一个字节，要先复制 1G。所以数据库、日志这类高频写的路径必须挂卷出去，不能写在容器可写层
+
+```bash
+# 看镜像分层与实际磁盘占用
+crictl imagefsinfo
+du -sh /var/lib/containerd
+```
+
+<Quiz
+  id="rt-1"
+  question="容器里执行 free -h，看到的内存总量是宿主机的全部内存，而不是 limits 里配的值。为什么？"
+  options={[
+    {
+      text: 'free 读的是 /proc/meminfo，而 /proc 没有被 cgroup 隔离',
+      correct: true,
+    },
+    { text: '配置的 limits 没有生效', feedback: 'limits 是生效的 —— 超了照样 OOMKilled。只是 free 看不到它。' },
+    { text: '容器共享了宿主机的 mnt namespace', feedback: 'mnt namespace 是隔离的，容器有自己的根文件系统。问题出在 /proc 的内容不受 cgroup 约束。' },
+    { text: '需要开启 user namespace 才能隔离', feedback: 'user namespace 管的是 UID 映射，与内存视图无关。' },
+  ]}
+  explain={<>namespace 隔离的是命名空间，cgroup 限制的是资源用量，两者是正交的。<code>/proc/meminfo</code> 属于宿主机视图，容器里的 <code>free</code>、<code>nproc</code>、<code>top</code> 都会读到宿主机的数值。这就是很多运行时（JVM、Go、Node）需要专门做「容器感知」的原因 —— 否则它们会按宿主机规格去设线程池和堆大小，然后被 OOMKill。</>}
+/>
+
+## 这一节留下的三个判断
+
+后面排障时会反复用到：
+
+1. **容器进程在宿主机上是可见的** —— 容器内工具不够用时，直接去宿主机的 `/proc/<pid>/` 查
+2. **CPU 超限是变慢，内存超限是被杀** —— 看到 `OOMKilled` 就直接去查内存，不用绕
+3. **容器里的资源视图会骗人** —— 判断资源是否够用，看 cgroup 文件和 K8s 的 metrics，不看容器里的 `free` 和 `top`

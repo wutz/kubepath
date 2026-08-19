@@ -1,0 +1,154 @@
+容器里的文件是临时的：容器崩溃重启，容器内创建和修改的文件就没了。K8s 用 Volume 解决这件事，并把它分成两大类。
+
+```
+Volume
+├─ Ephemeral Volume 临时卷（与 Pod 同生命周期）
+│   ├─ emptyDir            用宿主机系统盘或内存
+│   └─ configMap / secret  把配置挂进容器
+│
+└─ Persistent Volume 持久卷（超出 Pod 生命周期）
+    ├─ PV            集群里的一块存储
+    ├─ PVC           用户对存储的申请
+    └─ StorageClass  动态创建 PV 的模板
+```
+
+这一节把持久卷这条线讲透 —— 因为集群里几乎所有的存储故障都在这条线上。
+
+## PV / PVC / SC：谁创建、谁使用
+
+理解这三者最好的方式是看**谁创建它、它代表什么**：
+
+| 对象 | 谁创建 | 代表什么 |
+| --- | --- | --- |
+| **PV** | 管理员，或由 SC 自动创建 | 真实存在的一块存储后端 |
+| **PVC** | 应用开发者 | 「我要一块 20G 的存储，用 xxx 类型」 |
+| **StorageClass** | 管理员 | 创建 PV 的模板：用哪个驱动、什么参数 |
+
+手工维护成百上千个 PV 是不现实的，所以有了**动态供应（Dynamic Provisioning）**：管理员只定义 StorageClass，用户创建 PVC 时由驱动自动创建 PV 并绑定。
+
+```
+管理员视角                        用户视角
+─────────                        ────────
+部署 CSI 驱动         →
+创建 StorageClass     →         创建 PVC，指定 storageClassName
+                                     ↓（自动发生）
+                                K8s 通过 SC 调用 CSI 创建 PV 并绑定
+                                     ↓
+                                Pod 的 volumes 引用 PVC，
+                                通过 volumeMounts 挂到容器路径
+```
+
+<Callout type="note" title="这条链路和控制面是同一个模式">
+注意这里又是 reconcile：PVC 是期望态，PV 是实际态，中间有个控制器（external-provisioner）在不停地把两者拉平。
+
+所以排查思路和 L1 讲的一样 —— 看对象状态、看事件、看那个负责 reconcile 的控制器的日志。存储没有例外。
+</Callout>
+
+## accessModes：最容易配错的字段
+
+| 模式 | 缩写 | 含义 | 谁支持 |
+| --- | --- | --- | --- |
+| ReadWriteOnce | RWO | **单节点**读写 | 块存储（RBD、云盘、local） |
+| ReadOnlyMany | ROX | 多节点只读 | 多数后端 |
+| ReadWriteMany | RWX | 多节点读写 | 文件存储（CephFS、GPFS、NFS） |
+| ReadWriteOncePod | RWOP | 单 Pod 读写 | 较新特性，比 RWO 更严格 |
+
+<Callout type="trap" title="RWO 不是「只能一个 Pod 用」">
+RWO 的准确含义是**单节点**读写。同一节点上的多个 Pod 是可以共享一个 RWO 卷的 —— 因为挂载点在节点上。
+
+这会导致一类很难查的问题：本地测试时两个 Pod 恰好调度到同一节点，共享 RWO 卷工作正常；上生产后 Pod 分散到不同节点，开始报 `Multi-Attach error`，或者更糟 —— 两个节点同时挂载同一个块设备，把文件系统写坏。
+
+要严格限制单 Pod 使用，用 `ReadWriteOncePod`。要真正多节点共享，必须用支持 RWX 的文件存储。
+</Callout>
+
+## 回收策略与绑定模式
+
+这两个字段决定了「删 PVC 会发生什么」和「PV 什么时候创建」：
+
+```yaml
+reclaimPolicy: Delete        # PVC 删除后，PV 和后端存储一起删除
+# reclaimPolicy: Retain      # PVC 删除后保留 PV 与数据，需手工清理
+
+volumeBindingMode: Immediate              # PVC 创建后立刻创建并绑定 PV
+# volumeBindingMode: WaitForFirstConsumer # 等到有 Pod 使用时再创建
+```
+
+<Callout type="warn" title="生产环境的重要数据用 Retain">
+`Delete` 是默认值，也最省事 —— 但它意味着**误删一个 PVC 就直接销毁了后端数据**，没有回收站。
+
+重要数据的 StorageClass 应该配 `Retain`：PVC 删除后 PV 进入 `Released` 状态，数据还在，确认无误再手工删。多一步手工操作，换一次误删事故的兜底。
+
+`WaitForFirstConsumer` 则用于本地存储或有拓扑约束的后端：如果在知道 Pod 落在哪台节点之前就把 PV 创建出来，很可能建在错误的可用区或节点上，导致 Pod 根本调度不上去。
+</Callout>
+
+## CSI 架构：两侧，两类故障
+
+CSI（Container Storage Interface）把第三方存储和 K8s 解耦。一个 CSI 驱动通常部署成两部分：
+
+```
+controller（Deployment，通常 2 副本）
+  ├─ external-provisioner   创建 / 删除卷
+  ├─ external-attacher      attach / detach
+  ├─ external-resizer       扩容
+  ├─ external-snapshotter   快照
+  └─ CSI driver 本体
+
+node（DaemonSet，每节点一个）
+  ├─ node-driver-registrar  向 kubelet 注册
+  └─ CSI driver 本体        执行实际的 mount / umount
+```
+
+**这个架构直接给出了排障的分界线：创建卷的问题看 controller，挂载卷的问题看 node。**
+
+```bash
+# 卷创建不出来（PVC Pending）→ 看 provisioner
+kubectl -n <ns> logs deploy/<csi-controller> -c csi-provisioner
+
+# 卷创建了但 Pod 挂不上（Pod ContainerCreating）→ 看那台节点上的 node plugin
+kubectl -n <ns> logs <csi-node-pod-on-that-node> -c csi-<driver>
+```
+
+## 按现象选排查入口
+
+把上面所有内容压缩成一张值班时能直接用的表：
+
+| 现象 | 卡在哪 | 先看什么 |
+| --- | --- | --- |
+| PVC `Pending` | 卷还没创建出来 | `describe pvc` 的 Events → provisioner 日志 |
+| PVC `Bound` 但 Pod `ContainerCreating` | 卷创建了但挂不上 | 目标节点的 node plugin 日志 |
+| Pod 报 `Multi-Attach error` | accessMode 与实际用法冲突 | PVC 的 accessMode 与 Pod 分布 |
+| PVC 删了但 PV 还在 `Released` | `reclaimPolicy: Retain` 生效了 | 这是预期行为，确认后手工删 |
+| PV 卡在 `Terminating` | finalizer 没被摘掉 | 后端是否已删除、CSI 是否正常 |
+| 扩容不生效 | SC 未开 `allowVolumeExpansion` | SC 配置 + resizer 日志 |
+
+<Quiz
+  id="stor-1"
+  question="两个 Pod 要共享同一份数据。PVC 用的是 ceph-csi-rbd 的 StorageClass，accessMode 写了 ReadWriteMany。会发生什么？"
+  options={[
+    { text: '取决于两个 Pod 是否在同一节点；跨节点会报 Multi-Attach error 或写坏数据', correct: true },
+    { text: '正常工作，K8s 会处理好并发', feedback: 'K8s 不会阻止你，但一个块设备被两个节点同时挂载会写坏文件系统 —— 没有任何一层帮你协调。' },
+    { text: 'PVC 会一直 Pending', feedback: '部分驱动会在创建阶段就拒绝，但更常见的是创建成功、到挂载阶段才出问题。' },
+    { text: '会自动降级成 ReadWriteOnce', feedback: 'K8s 不会自动改写你的声明。' },
+  ]}
+  explain={<>写下 RWX 并不会让块存储变成共享存储 —— accessMode 是一个声明，不是一个能力开关。这类问题在测试环境常常「看起来正常」，因为两个 Pod 恰好落在同一节点。真正需要多节点共享，必须换成 CephFS / GPFS / NFS 这类文件存储。</>}
+/>
+
+<Quiz
+  id="stor-2"
+  question="一个 PVC 状态是 Bound，但使用它的 Pod 一直卡在 ContainerCreating。应该去看哪里？"
+  options={[
+    { text: 'Pod 所在节点上的 CSI node plugin 日志', correct: true },
+    { text: 'CSI controller 的 provisioner 日志', feedback: 'PVC 已经 Bound，说明卷创建成功了 —— provisioner 的活已经干完。' },
+    { text: 'StorageClass 的参数配置', feedback: 'SC 参数影响的是卷的创建阶段，这一步已经过了。' },
+    { text: 'etcd 的健康状态', feedback: '对象状态都正常读写，etcd 没问题。' },
+  ]}
+  explain={<>Bound 是分界线：卷已经创建好了，问题在挂载阶段。挂载是由目标节点上的 node plugin（DaemonSet）执行的，所以要先 <code>kubectl get pod -o wide</code> 找到 Pod 在哪台节点，再去看那台节点上对应的 node plugin 日志。同时值得看一眼 <code>describe pod</code> 的 Events，挂载失败的原因常常直接写在那里。</>}
+/>
+
+## 这节课的落点
+
+- PV 是实物、PVC 是申请、SC 是模板；动态供应把管理员从手工建 PV 里解放出来
+- RWO 是**单节点**而不是单 Pod，跨节点共享必须用支持 RWX 的文件存储
+- 重要数据的 SC 配 `reclaimPolicy: Retain`
+- CSI 分 controller（创建卷）和 node（挂载卷）两侧，**PVC Pending 看前者，Pod ContainerCreating 看后者**
+- 存储也是 reconcile 模式，排查套路和其它对象完全一致

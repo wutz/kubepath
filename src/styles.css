@@ -1,0 +1,183 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-50: oklch(0.97 0.02 240);
+  --color-brand-100: oklch(0.93 0.04 240);
+  --color-brand-500: oklch(0.58 0.16 250);
+  --color-brand-600: oklch(0.51 0.17 252);
+  --color-brand-700: oklch(0.44 0.15 254);
+}
+
+html {
+  /* 横屏转竖屏时 iOS 会自作主张放大字号 */
+  -webkit-text-size-adjust: 100%;
+  /* 顶栏是 sticky 的，锚点跳转要留出它的高度 */
+  scroll-padding-top: 4.5rem;
+}
+
+/*
+ * 兜底：任何一处算漏的宽度都不许把整页撑出屏幕。
+ * 用 clip 而不是 hidden —— hidden 会让 body 变成滚动容器，顶栏的 sticky 就失效了。
+ */
+body {
+  overflow-x: clip;
+}
+
+/* Shiki 双主题：默认亮色，后续如接入暗色模式再切换变量 */
+.shiki {
+  padding: 1rem 1.125rem;
+  font-size: 0.8125rem;
+  line-height: 1.7;
+}
+
+/* MDX 正文排版（不引 typography 插件，保持依赖精简） */
+.lesson-body {
+  line-height: 1.85;
+  color: var(--color-gray-700);
+  /* 长路径、长 URL 不许顶破容器 */
+  overflow-wrap: break-word;
+}
+.lesson-body > * + * {
+  margin-top: 1rem;
+}
+.lesson-body h2 {
+  margin-top: 2.5rem;
+  font-size: 1.375rem;
+  font-weight: 700;
+  color: var(--color-gray-900);
+  border-bottom: 1px solid var(--color-gray-200);
+  padding-bottom: 0.5rem;
+}
+.lesson-body h3 {
+  margin-top: 1.75rem;
+  font-size: 1.0625rem;
+  font-weight: 700;
+  color: var(--color-gray-900);
+}
+.lesson-body ul,
+.lesson-body ol {
+  padding-left: 1.5rem;
+}
+.lesson-body ul {
+  list-style: disc;
+}
+.lesson-body ol {
+  list-style: decimal;
+}
+.lesson-body li + li {
+  margin-top: 0.375rem;
+}
+.lesson-body a {
+  color: var(--color-brand-600);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+/*
+ * 代码块。没标语言的 ``` 块 shiki 不会处理，拿不到 .shiki 类，
+ * 所以横向滚动和外观都要在 pre 这一层补上，否则宽输出会把整页撑破。
+ * 选择器只认 MDX 产出的两种 pre —— 带 .shiki 的和完全没有 class 的，
+ * 交互组件（如 Terminal）内部自带 class 的 pre 不受影响。
+ */
+.lesson-body pre.shiki,
+.lesson-body pre:not([class]) {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  border: 1px solid var(--color-gray-200);
+  border-radius: 0.5rem;
+}
+.lesson-body pre:not([class]) {
+  background: #fff;
+  color: var(--color-gray-800);
+  padding: 1rem 1.125rem;
+  font-size: 0.8125rem;
+  line-height: 1.7;
+}
+/* 行内代码——只作用于不在 pre 里的 code */
+.lesson-body :not(pre) > code {
+  background: var(--color-gray-100);
+  color: var(--color-gray-800);
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.25rem;
+  font-size: 0.85em;
+}
+.lesson-body table {
+  width: 100%;
+  font-size: 0.875rem;
+  border-collapse: collapse;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+.lesson-body th,
+.lesson-body td {
+  border: 1px solid var(--color-gray-200);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+}
+.lesson-body th {
+  background: var(--color-gray-50);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.lesson-body blockquote {
+  border-left: 3px solid var(--color-gray-300);
+  padding-left: 1rem;
+  color: var(--color-gray-500);
+}
+.lesson-body hr {
+  border-color: var(--color-gray-200);
+  margin: 2rem 0;
+}
+
+/* ---------- 手机（< 640px） ---------- */
+@media (max-width: 639px) {
+  /*
+   * iOS Safari 在字号小于 16px 的输入框获得焦点时会自动放大整页，
+   * 而且失焦后不缩回去 —— 表现就是"宽度卡住了"。所有表单控件统一 16px。
+   */
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+
+  .lesson-body {
+    line-height: 1.8;
+  }
+  .lesson-body pre.shiki,
+  .lesson-body pre:not([class]) {
+    padding: 0.75rem 0.875rem;
+    font-size: 0.75rem;
+  }
+  .lesson-body h2 {
+    margin-top: 2rem;
+    font-size: 1.1875rem;
+  }
+  .lesson-body h3 {
+    margin-top: 1.5rem;
+    font-size: 1rem;
+  }
+  .lesson-body ul,
+  .lesson-body ol {
+    padding-left: 1.25rem;
+  }
+  .lesson-body blockquote {
+    padding-left: 0.75rem;
+  }
+  /*
+   * 窄屏下不要把列硬压成一字一行，让表格按内容撑开、整体横向滚动更好读。
+   * 单列窄表仍然铺满宽度。
+   */
+  .lesson-body table {
+    width: max-content;
+    min-width: 100%;
+    font-size: 0.8125rem;
+  }
+  .lesson-body th,
+  .lesson-body td {
+    padding: 0.4rem 0.6rem;
+  }
+}

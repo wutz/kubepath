@@ -1,0 +1,199 @@
+这一节只解决一个问题：**手里这批盘，能不能给 etcd 用**。
+
+它值得单独占一节，因为这是 K8s 部署前唯一能独立测出来、且测不过就必须换硬件的指标。集群建起来之后再发现盘不行，代价是停机迁移 etcd 数据目录。
+
+## 为什么 etcd 这么挑盘
+
+etcd 用 Raft 协议保证一致性，而 Raft 有一条不能商量的规则：**每次写提案，必须 fsync 落盘之后才能确认**。不是写到 page cache 就算，是真的要落到介质上。
+
+于是一次 `kubectl apply` 的写入延迟里，包含了一次磁盘 fsync 的完整耗时。盘慢一点，整条链路都跟着慢：
+
+```
+盘 fsync 慢
+  → etcd 写提案确认慢
+    → apiserver 写请求超时
+      → 心跳超不上 → 触发选主 → 选主期间集群不可写
+        → kubelet 上报状态失败 → 节点开始随机 NotReady
+```
+
+**这就是"集群整体发黏"最常见的根因**。表现五花八门，根子在一块盘上。
+
+## 硬件要求：先排除掉不能用的
+
+| 项目 | 要求 |
+| --- | --- |
+| 磁盘类型 | NVMe SSD 优先，SATA SSD 可接受 |
+| 磁盘占用 | **独占一块盘**，不与系统盘、日志盘共享 |
+| 明确禁止 | 机械盘、NAS、SAN、iSCSI、Ceph RBD、NFS |
+
+小集群最低 50 顺序写 IOPS，大集群推荐 500 以上。
+
+<Callout type="trap" title="千万不要把 etcd 放在网络存储上">
+这是搭实验环境时最容易犯的错：集群里已经有一套 Ceph 或者 GPFS，很自然就想"数据目录都放共享存储，节点坏了好迁移"。
+
+但网络存储的 fsync 要多跨一次网络往返 —— 延迟从几十微秒变成几毫秒甚至几十毫秒，而且抖动大得多。更糟的是形成了循环依赖：存储集群出问题会拖垮 K8s 控制面，而存储的 CSI 又跑在这个 K8s 上。
+
+etcd 的数据目录必须是**本地盘**，而且最好独占。它一共就那么几个 GB，不值得为它省一块盘。
+</Callout>
+
+## 部署前必测：fio 模拟 WAL 写入
+
+关键是让 fio 的行为像 etcd 写 WAL：小块、顺序、每写一次就 fdatasync。
+
+```bash
+fio --rw=write --ioengine=sync --fdatasync=1 \
+    --directory=/var/lib/etcd \
+    --size=22m --bs=2300 \
+    --name=etcd-test
+```
+
+参数逐个解释 —— 这几个值都不是随便填的：
+
+| 参数 | 为什么是这个值 |
+| --- | --- |
+| `--fdatasync=1` | 每写一次就同步一次，这是模拟 etcd 行为的**核心**，去掉就毫无意义 |
+| `--bs=2300` | 匹配 etcd WAL 条目的典型大小 |
+| `--ioengine=sync` | etcd 的 WAL 写入是同步的，不用异步引擎 |
+| `--directory` | 必须指向 etcd **实际要用的**那个路径，不同盘结果差很远 |
+| `--size=22m` | 约产生 10⁴ 个样本，让 p99 的统计有意义 |
+
+> fio 版本需要 ≥ 3.5，旧版不报 fdatasync 的百分位。
+
+不确定 WAL 条目大小时，可以在已有集群上实测：
+
+```bash
+strace -p $(pgrep etcd) -e write 2>&1 | head -50
+```
+
+## 结果判定：只看一个数
+
+输出里找 `sync percentiles (usec)` 这一段：
+
+```
+sync percentiles (usec):
+| 99.00th =[ 2376]    ← 2.4ms，合格
+| 99.50th =[ 9634]    ← 9.6ms，勉强
+| 99.90th =[15795]    ← p99.9 不看
+```
+
+**判定标准：99.00th < 10000 usec（10ms）即通过。**
+
+<Callout type="warn" title="测出 9ms 不叫「刚好通过」">
+fio 是隔离测试 —— 机器上只有它一个在写。真实运行的 etcd 还有 boltdb 刷盘、快照、压缩这些额外 I/O 一起抢盘。
+
+所以 fio 测出接近 10ms，意味着上线后余量为零，稍有并发就会突破。测出来在 3ms 以内才叫有余量。
+</Callout>
+
+## 部署后：三个必须盯住的指标
+
+fio 只能验收硬件。上线后要持续监控的是运行态：
+
+| 指标 | 目标 | 说明 |
+| --- | --- | --- |
+| `etcd_disk_wal_fsync_duration_seconds` p99 | < 10ms | 和部署前同一个口径 |
+| `etcd_disk_backend_commit_duration_seconds` p99 | < 25ms | boltdb 刷盘，无法提前测 |
+| `etcd_server_leader_changes_seen_total` | 0 | 在涨就是磁盘或网络有问题 |
+
+```promql
+histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m]))
+histogram_quantile(0.99, rate(etcd_disk_backend_commit_duration_seconds_bucket[5m]))
+increase(etcd_server_leader_changes_seen_total[15m])
+```
+
+官方告警阈值放得比验收线宽得多 —— warning 是 fsync p99 > 500ms 持续 10 分钟，critical 是 > 1s。**别拿告警阈值当验收标准**：等它响的时候，集群已经很难用了。自己的告警建议设在 50–100ms。
+
+## 上机演练
+
+下面这一关模拟部署前的验收现场：两台候选机器，选出能用的那台。
+
+<Terminal
+  id="etcd-disk-check"
+  host="root@mn-10-128-0-1"
+  intro={`模拟终端：新到两批机器，要给 etcd 选盘。
+输入 goals 看目标，hint 要提示。`}
+  commands={[
+    {
+      cmd: 'lsblk -d -o NAME,SIZE,ROTA,MODEL',
+      goal: '先确认盘的类型，排除掉机械盘',
+      hint: 'ROTA=1 是机械盘，直接淘汰。',
+      output: `NAME    SIZE ROTA MODEL
+nvme0n1 894G    0 SAMSUNG MZQL2960HCJR-00A07
+nvme1n1 894G    0 SAMSUNG MZQL2960HCJR-00A07
+sda     3.6T    1 ST4000NM000A-2HZ100`,
+    },
+    {
+      cmd: 'df -h /var/lib/etcd',
+      goal: '确认 etcd 数据目录落在哪块盘上',
+      hint: '别只看有 NVMe，要确认 etcd 那个路径真的挂在 NVMe 上。',
+      output: `Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme1n1p1  879G  2.1G  832G   1% /var/lib/etcd`,
+    },
+    {
+      cmd: 'fio --rw=write --ioengine=sync --fdatasync=1 --directory=/var/lib/etcd --size=22m --bs=2300 --name=etcd-test',
+      goal: '跑 fio 拿到 fsync 的 p99',
+      hint: '关键参数是 --fdatasync=1，少了它测的就不是 etcd 的场景。',
+      output: `etcd-test: (g=0): rw=write, bs=(R) 2300B-2300B, ioengine=sync, iodepth=1
+Jobs: 1 (f=1)
+etcd-test: (groupid=0, jobs=1): err= 0: pid=28471
+
+  write: IOPS=3128, BW=6.86MiB/s (7.19MB/s)(22.0MiB/3206msec)
+    clat (nsec): min=1170, max=98410, avg=2743.21, stdev=1892.44
+     lat (usec): min=1, max=98, avg= 2.79, stdev= 1.90
+  fsync/fdatasync/sync_file_range:
+    sync (usec): min=142, max=6812, avg=313.28, stdev=142.61
+    sync percentiles (usec):
+     |  1.00th=[  180],  5.00th=[  205], 10.00th=[  219],
+     | 50.00th=[  286], 90.00th=[  437], 95.00th=[  502],
+     | 99.00th=[  807], 99.50th=[ 1020], 99.90th=[ 2606],
+     | 99.99th=[ 5342]
+
+Run status group 0 (all jobs):
+  WRITE: bw=6.86MiB/s (7.19MB/s), io=22.0MiB, run=3206-3206msec`,
+    },
+    {
+      cmd: 'fio --rw=write --ioengine=sync --fdatasync=1 --directory=/data --size=22m --bs=2300 --name=etcd-test-sata',
+      goal: '对比另一块候选盘，看清差距有多大',
+      hint: '/data 挂在那块 SATA 机械盘上，测一下就知道为什么禁用它。',
+      output: `etcd-test-sata: (groupid=0, jobs=1): err= 0: pid=28994
+
+  write: IOPS=41, BW=94.3KiB/s (96.5kB/s)(22.0MiB/238905msec)
+  fsync/fdatasync/sync_file_range:
+    sync (usec): min=4102, max=192843, avg=23847.11, stdev=11204.32
+    sync percentiles (usec):
+     |  1.00th=[ 6144],  5.00th=[ 9152], 10.00th=[11072],
+     | 50.00th=[21120], 90.00th=[38144], 95.00th=[45568],
+     | 99.00th=[72192], 99.50th=[91648], 99.90th=[141312],
+     | 99.99th=[190464]
+
+Run status group 0 (all jobs):
+  WRITE: bw=94.3KiB/s (96.5kB/s), io=22.0MiB, run=238905-238905msec`,
+    },
+  ]}
+/>
+
+两个结果的差距是数量级的：NVMe 的 p99 是 **807 usec（0.8ms）**，余量充足；机械盘的 p99 是 **72192 usec（72ms）**，超标七倍以上。装上去集群会一直选主，而现象会伪装成"网络不稳定"。
+
+<Quiz
+  id="etcd-1"
+  question="fio 测出 sync 的 99.00th = 8500 usec。以下判断哪个最合理？"
+  options={[
+    {
+      text: '数值上通过了 10ms 的线，但余量太小，应该换更快的盘',
+      correct: true,
+    },
+    { text: '低于 10ms 就是合格，可以直接上线', feedback: 'fio 是隔离测试，真实 etcd 还有 boltdb 刷盘、快照与压缩的额外 I/O，8.5ms 上线后必然突破。' },
+    { text: '不合格，必须低于 1ms', feedback: '1ms 是好盘的表现，但不是验收线。判定标准是 p99 < 10ms，只是要留足余量。' },
+    { text: '要再看 99.90th 才能判断', feedback: 'p99.9 会被极少数长尾拉高，官方判定只看 99.00th。' },
+  ]}
+  explain={<>验收线是 99.00th &lt; 10000 usec，但 fio 跑的是一台空机器。真实场景里 etcd 还有其它 I/O 竞争同一块盘，所以 8.5ms 相当于零余量。经验做法：测出来在 3ms 以内才算放心上线。</>}
+/>
+
+## 验收清单
+
+装机之前照着走一遍：
+
+1. `lsblk -d -o NAME,SIZE,ROTA` 确认不是机械盘（ROTA=0）
+2. 确认 `/var/lib/etcd` 独占一块盘，不和系统盘或日志盘混用
+3. 确认不是任何形式的网络存储
+4. fio 跑出 `99.00th` < 3000 usec 才算有余量，< 10000 usec 是底线
+5. 上线后配好三个监控指标，告警设在 50–100ms，而不是官方的 500ms
