@@ -16,9 +16,9 @@
   "dependencies": {
     "@mdx-js/react": "^3.1.1",
     "@tailwindcss/vite": "^4.1.18",
-    "@tanstack/react-router": "^1.120.20",
-    "@tanstack/react-start": "^1.120.20",
-    "@tanstack/router-plugin": "^1.120.20",
+    "@tanstack/react-router": "1.170.27",
+    "@tanstack/react-start": "1.168.44",
+    "@tanstack/router-plugin": "1.168.30",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "tailwindcss": "^4.1.18"

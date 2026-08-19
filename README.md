@@ -70,8 +70,33 @@ bun run typecheck
 bun run deploy     # 手工部署到 Cloudflare Workers
 ```
 
-> `bun.lock` 是从 storpath 复制过来的 —— 不带锁文件直接装会解析到一个依赖损坏的
-> `@tanstack/start-client-core` 版本。升级依赖时注意这一点。
+### 关于 `@tanstack/*` 的精确版本
+
+三个 `@tanstack/*` 包在 `package.json` 里写的是**精确版本**而不是 `^` 范围，这是刻意的：
+
+TanStack 的包之间用精确版本互锁（`react-start@1.168.44` 精确依赖
+`start-client-core@1.170.22`），而它一天要发好几个版本。国内镜像
+（`registry.npmmirror.com`）同步有先后，经常出现「新版 `react-start` 同步到了、
+它依赖的那个 `start-client-core` 还没到」的中间状态。此时 `^` 范围会解到最新版，
+然后报：
+
+```
+error: No version matching "1.170.25" found for specifier "@tanstack/start-client-core" (but package exists)
+```
+
+—— 注意 `(but package exists)`，包在、只是那个版本还没同步过来。钉死版本就不会去追
+`latest`，也就不会撞上这个竞态。
+
+**要升级 TanStack 时**：手工改 `package.json` 里这三个版本号，然后
+
+```bash
+# 从 npmjs.org 装，绕开镜像的同步延迟
+bun install --registry=https://registry.npmjs.org
+bun run typecheck && bun run build
+```
+
+三个版本号必须一起对齐 —— `react-start` 会精确指定它要的 `react-router` 版本，
+`bun install` 的输出里会直接提示可用的新版本号。
 
 ## 持续部署
 
