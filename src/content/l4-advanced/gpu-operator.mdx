@@ -1,0 +1,220 @@
+把一台插了八张卡的机器变成集群里可调度的 GPU 节点，比「装个驱动」复杂得多：驱动、fabric manager、容器运行时、设备插件、节点标签、拓扑感知，缺一环 Pod 就拿不到卡。
+
+## GPU Operator 管了哪些组件
+
+```
+NFD（Node Feature Discovery）        先探测硬件，打节点标签
+   ↓  nvidia.com/gpu.present=true
+GPU Operator
+   ├─ driver                    GPU 驱动（容器化或用宿主机已装的）
+   ├─ nvidia-container-toolkit  让 containerd 能把 GPU 设备透进容器
+   ├─ device-plugin             向 kubelet 注册 nvidia.com/gpu 资源
+   ├─ dcgm-exporter             GPU 指标（给监控用）
+   ├─ gpu-feature-discovery     打细粒度标签（卡型、显存、MIG 配置）
+   └─ mig-manager               MIG 切分（可选）
+```
+
+顺序是有依赖的：NFD 先打标签，Operator 按标签决定在哪些节点上部署组件。
+
+## 驱动：宿主机装还是容器化装
+
+| 方式 | 优点 | 缺点 |
+| --- | --- | --- |
+| **宿主机装（推荐）** | 与内核绑定关系明确，节点重启后立即可用；排障简单 | 需要维护装机流程，内核升级要重装 |
+| 容器化装 | 版本随 chart 管理，节点无需预装 | 每次节点重启要重新编译/加载模块，启动慢；内核不匹配时故障面大 |
+
+```bash
+# 宿主机装驱动，版本对齐 values.yml 里的 driver.version
+# 先清理残留的旧驱动 —— 混装是很多诡异问题的根源
+apt-get remove --purge '^nvidia-.*'          # apt 装的
+./NVIDIA-Linux-x86_64-*.run --uninstall      # run 包装的
+
+bash NVIDIA-Linux-x86_64-xxx.xx.xx.run
+nvidia-smi
+```
+
+<Callout type="warn" title="有 NVLink 的卡必须装 fabric manager">
+H100 / H200 / B200 / B300 这些带 NVSwitch 的机型，除了驱动还要装 `nv-fabricmanager`，版本要和驱动分支一致：
+
+```bash
+apt install nvidia-fabricmanager-<driver-branch>
+systemctl enable --now nvidia-fabricmanager
+
+# B200/B300 还要额外装 open 版驱动和 nvlink5
+apt-get install nvidia-open-<driver-branch>
+apt-get install nvlink5-<driver-branch>
+
+# 验证 fabric 状态 —— 这一步不能省
+nvidia-smi -q -i 0 | grep -i -A 2 Fabric
+#     Fabric
+#         State : Completed
+#         Status : Success
+```
+
+不装 fabric manager 的后果：**`nvidia-smi` 看起来正常，卡也能被调度，但 NVLink 不可用** —— 多卡训练会退化到走 PCIe，性能差一个量级。而这个问题不会有任何报错，只会表现为「训练比预期慢很多」。
+
+所以 `Fabric State: Completed` 是 GPU 节点的验收项之一。
+</Callout>
+
+> 注意 GPU Operator **不支持 Ubuntu 20.04**，装机时的 OS 版本选择要提前确认。
+
+## 部署
+
+```bash
+# 1. 先装 NFD
+cd base/nfd && helmwave up --build
+
+kubectl get node -o json | jq '.items[].metadata.labels' | grep -i pci
+# NFD 会打上 feature.node.kubernetes.io/pci-10de.present=true（10de 是 NVIDIA 的厂商 ID）
+
+# 2. 装 GPU Operator
+cd ai/gpu-operator && helmwave up --build
+
+kubectl -n gpu-operator get pod
+```
+
+## 验证：四步
+
+```bash
+# 1. 节点上报了 GPU 资源
+kubectl get node gn-10-128-1-1 -o jsonpath='{.status.allocatable}' | jq
+# "nvidia.com/gpu": "8"
+
+# 2. gpu-feature-discovery 打上了细粒度标签
+kubectl get node gn-10-128-1-1 --show-labels | tr ',' '\n' | grep nvidia
+# nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3
+# nvidia.com/gpu.count=8
+# nvidia.com/gpu.memory=81559
+
+# 3. Pod 真的拿到卡
+kubectl run gpu-test --rm -it --restart=Never \
+  --image=nvcr.io/nvidia/cuda:12.6.0-base-ubuntu22.04 \
+  --overrides='{"spec":{"containers":[{"name":"c","image":"nvcr.io/nvidia/cuda:12.6.0-base-ubuntu22.04","command":["nvidia-smi"],"resources":{"limits":{"nvidia.com/gpu":"1"}}}]}}'
+
+# 4. 拓扑与 NVLink
+kubectl exec -it <gpu-pod> -- nvidia-smi topo -m
+```
+
+第 4 步对应 L0《硬件与拓扑》讲的内容：确认 GPU 之间是 `NV#`（NVLink）而不是 `SYS`（跨 NUMA 走 CPU 互联），以及 GPU 与 RDMA 网卡在同一 NUMA。
+
+## 资源申请的规矩
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: 2      # 只能写 limits，必须整数
+```
+
+三条规则（L1《调度器》讲过）：
+
+1. **不可超卖** —— 一张卡同时只给一个容器，除非用 MIG 或 time-slicing
+2. **requests 自动等于 limits** —— GPU Pod 天然是 Guaranteed
+3. **必须显式申请**
+
+<Callout type="trap" title="禁止用 NVIDIA_VISIBLE_DEVICES=all 绕过资源系统">
+L0《运行时与 CRI》讲过这个坑，这里给出制度化的解法。
+
+不申请 `resources.limits.nvidia.com/gpu`、直接设 `NVIDIA_VISIBLE_DEVICES=all` 的 Pod 会有两个严重问题：
+
+1. **在宿主机执行 `systemctl daemon-reload` 后失去设备权限** —— Pod 里 `nvidia-smi` 报 `Failed to initialize NVML: Unknown Error`。正常申请 GPU 的 Pod 不受影响（gpu-operator 22.9.2+ 通过注入设备软链接解决了），但这类 Pod 走不到那段逻辑
+2. **绕过了资源核算** —— 调度器不知道它占了卡，会把别的 GPU Pod 也调度到同一节点，两个任务抢同一张卡
+
+短期规避是把 containerd 切成 cgroupfs 驱动（`containerd_use_systemd_cgroup: false`），但**更好的做法是从规范入手**：用准入策略（Kyverno / OPA）拒绝设置了 `NVIDIA_VISIBLE_DEVICES` 的 Pod。一条策略同时解决两个问题。
+</Callout>
+
+## MIG 与共享方案
+
+一张 H100 给一个只需要少量算力的推理服务，是巨大的浪费。三种共享方式：
+
+| 方案 | 隔离性 | 显存隔离 | 适合 |
+| --- | --- | --- | --- |
+| **MIG** | 硬件级 | **有** | 多租户推理，A100/H100 才支持 |
+| **time-slicing** | 无（时间片轮转） | **无** | 开发测试环境 |
+| **MPS** | 弱 | 无 | 同一用户的多个小任务 |
+
+```yaml
+# MIG：切成 7 个 1g.10gb 实例
+# gpu-operator 的 values 里配 migManager，节点上打标签选择 profile
+kubectl label node gn-10-128-1-1 nvidia.com/mig.config=all-1g.10gb
+```
+
+<Callout type="warn" title="time-slicing 没有显存隔离，生产别用">
+time-slicing 让多个容器轮流用同一张卡，但**显存是共享的**：一个容器 OOM 会连带影响其它容器，而且谁也不知道是谁的问题。
+
+它适合的场景只有一个：开发测试环境里让多人共享少量卡做调试。生产的多租户推理必须用 MIG —— 它是硬件级切分，显存和 SM 都是隔离的。
+
+代价是 MIG 的实例规格是固定的几种 profile，切分后不能动态调整，而且切换 profile 需要节点上没有 GPU 任务。
+</Callout>
+
+## 常见故障
+
+| 现象 | 原因 |
+| --- | --- |
+| 节点没有 `nvidia.com/gpu` 资源 | device-plugin 没起来；NFD 标签没打上；驱动没装好 |
+| Pod Pending，`Insufficient nvidia.com/gpu` | 卡都被占了；或被 `NVIDIA_VISIBLE_DEVICES=all` 的 Pod 隐形占用 |
+| Pod 里 `nvidia-smi` 报 NVML 错误 | `daemon-reload` 坑；或容器运行时未正确配置 |
+| 卡可见但多卡训练很慢 | **fabric manager 没装**；或跨 NUMA 拓扑问题 |
+| 驱动 Pod CrashLoop | 内核版本与驱动不匹配（内核自动升级过） |
+
+```bash
+# 排查入口
+kubectl -n gpu-operator logs ds/nvidia-device-plugin-daemonset
+kubectl -n gpu-operator logs ds/nvidia-container-toolkit-daemonset
+nvidia-smi -q | grep -i -A2 fabric
+dmesg -T | grep -i nvidia
+```
+
+<Callout type="tip" title="GPU 节点必须禁止内核自动升级">
+L0《节点 OS 基线》里提过这一项，在 GPU 节点上它是硬要求。
+
+宿主机装的驱动是针对特定内核版本编译的。内核自动升级之后驱动模块加载失败 —— 节点重启后 `nvidia-smi` 直接不可用，所有 GPU Pod 起不来。
+
+而且这类故障往往在一次计划外重启时才暴露，那时候已经过了很久，没人记得内核升级过。
+</Callout>
+
+## 交付前的基准测试
+
+规格书上的数字不等于实测性能。GPU 节点交付前必须跑两个测试：
+
+```bash
+# 1. nvbandwidth：Host↔Device 与 Device↔Device 带宽
+#    验证 PCIe 通道数、NVLink 是否生效
+
+# 2. nccl-tests：多机 AllReduce
+#    验证 RDMA 网络、拓扑绑定、fabric manager
+```
+
+对照 L0《硬件与拓扑》里的判断：**实测带宽只有理论值一半，通常是跨 NUMA 或 RoCE 无损网络没配对**。
+
+<Quiz
+  id="gpu-1"
+  question="H100 八卡机上 nvidia-smi 正常、卡能被调度，但多机训练性能只有预期的三分之一。最该先查什么？"
+  options={[
+    { text: 'nv-fabricmanager 是否安装并运行，Fabric State 是否 Completed', correct: true },
+    { text: 'GPU 驱动版本是否太旧', feedback: '驱动有问题通常 nvidia-smi 就异常了。这里 nvidia-smi 正常，说明驱动基本可用。' },
+    { text: '增加 Pod 的 CPU limits', feedback: 'CPU 不足会表现为 GPU 利用率低（等数据），而不是多卡通信慢。值得排查但不是第一位。' },
+    { text: '调大 batch size', feedback: '这是调参，不解决基础设施配置错误 —— 反而会掩盖问题。' },
+  ]}
+  explain={<>带 NVSwitch 的机型（H100/H200/B200/B300）不装 <code>nv-fabricmanager</code> 时，NVLink 不可用，卡间通信退化到走 PCIe —— 性能差一个量级。最麻烦的是<strong>它不报任何错</strong>：<code>nvidia-smi</code> 正常、卡能调度、任务能跑，只是慢。所以 <code>nvidia-smi -q | grep -A2 Fabric</code> 显示 <code>State: Completed</code> 必须作为 GPU 节点的验收项，而不是等性能不达标时才想起来查。</>}
+/>
+
+<Quiz
+  id="gpu-2"
+  question="关于 GPU 共享方案，下面哪些说法正确？"
+  options={[
+    { text: 'MIG 是硬件级切分，显存和 SM 都隔离', correct: true },
+    { text: 'time-slicing 没有显存隔离，一个容器 OOM 会影响其它容器', correct: true },
+    { text: '生产的多租户推理应该用 MIG 而不是 time-slicing', correct: true },
+    { text: 'MIG 切分后可以随时动态调整 profile', feedback: 'MIG profile 是固定的几种规格，切换需要节点上没有正在运行的 GPU 任务 —— 不能动态调整。' },
+  ]}
+  explain={<>三种共享方案的隔离强度递减：MIG（硬件级，显存+SM 隔离）→ MPS（弱）→ time-slicing（仅时间片轮转，无任何资源隔离）。生产多租户必须 MIG，因为没有显存隔离意味着一个用户能把别人的任务搞崩，而且无法归因。MIG 的代价是规格固定、切换需要清空节点。</>}
+/>
+
+## 这一节的落点
+
+- 组件链：**NFD → driver → container-toolkit → device-plugin → dcgm-exporter**
+- 驱动**优先装在宿主机**上；GPU 节点必须**禁止内核自动升级**
+- **NVLink 机型必须装 fabric manager**，`Fabric State: Completed` 是验收项 —— 不装不报错，只是慢一个量级
+- GPU 只能写 limits、不可超卖、必须显式申请；**用准入策略禁掉 `NVIDIA_VISIBLE_DEVICES=all`**
+- 多租户推理用 MIG，time-slicing 只适合开发测试
+- 交付前必须跑 `nvbandwidth` 和 `nccl-tests`，规格书不等于实测

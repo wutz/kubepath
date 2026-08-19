@@ -1,0 +1,242 @@
+kubeadm 能把集群装出来，但它只管到「节点 join 上了」。剩下的事情 —— 高可用入口、CNI、镜像源、证书有效期、节点内核参数 —— 都得你自己一台台做。
+
+kubespray 是一套 Ansible playbook，把这些都编排好了。它底下**仍然用 kubeadm**，所以出错时你要知道自己在看哪一层。
+
+## 部署前：三件事必须先完成
+
+跑 playbook 之前，如果这三件没做完，装出来的集群早晚要返工：
+
+1. **规划已定稿** —— 节点命名、三段网段、控制面节点数（见 L0《集群规划》）
+2. **etcd 盘已验收** —— `fio --fdatasync=1` 的 p99 < 3ms（见 L0《etcd 磁盘验收》）
+3. **节点 OS 基线已对齐** —— 内核模块、sysctl、swap、时间同步（见 L0《节点 OS 基线》）
+
+<Callout type="warn" title="Cilium 会占用几个路由表号">
+Cilium 会用 route table **200 / 202 / 2004 / 2005**。如果宿主机的网络配置（比如多网卡策略路由、RDMA 网络）也用了这些表号，会导致网络异常 —— 而且现象很难定位。
+
+装之前先在节点上确认：
+
+```bash
+ip rule list
+cat /etc/iproute2/rt_tables
+```
+有冲突就改宿主机的配置，这比事后查一个「偶发丢包」要便宜得多。
+</Callout>
+
+## 环境准备
+
+在一台能 **ssh 免密访问所有节点**的机器上操作（可以是控制面节点之一，也可以是单独的跳板机）：
+
+```bash
+export KUBESPRAY_VERSION="2.31.0"
+export UV_VERSION="0.11.7"
+```
+
+用 `uv` 管 Python 环境，比 `pip + virtualenv` 快得多：
+
+```bash
+# 装 uv
+wget https://file.mir.blsc.cn/uv/releases/${UV_VERSION}/uv-x86_64-unknown-linux-musl.tar.gz
+tar zxvf uv-x86_64-unknown-linux-musl.tar.gz
+cp uv-x86_64-unknown-linux-musl/* /usr/local/bin/
+
+# 配 PyPI 镜像
+mkdir -p ~/.config/uv
+cat << 'EOF' > ~/.config/uv/config.toml
+[[index]]
+url = "https://mirrors.ustc.edu.cn/pypi/simple"
+default = true
+EOF
+```
+
+```bash
+# 下载 kubespray 并装依赖
+wget https://file.mir.blsc.cn/kubespray/releases/kubespray-${KUBESPRAY_VERSION}.tar.gz
+tar zxvf kubespray-${KUBESPRAY_VERSION}.tar.gz
+cd kubespray-${KUBESPRAY_VERSION}
+
+export UV_PYTHON_INSTALL_MIRROR=https://file.mir.blsc.cn/uv/py/
+uv venv --python 3.12.12
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
+<Callout type="note" title="Ansible 版本必须和 kubespray 版本配套">
+`requirements.txt` 里的 ansible 版本是和这个 kubespray 版本一起测过的。用系统包管理器装的 ansible 大概率版本不对，症状是 playbook 跑到一半报某个 filter 或 module 不存在。
+
+始终用 venv + `requirements.txt`，别图省事用系统的 ansible。
+</Callout>
+
+## inventory：节点角色划分
+
+```ini
+# inventory/mycluster/inventory.ini
+[kube_control_plane]
+mn-192-168-3-21 ansible_host=192.168.3.21 etcd_member_name=etcd1
+mn-192-168-3-22 ansible_host=192.168.3.22 etcd_member_name=etcd2
+mn-192-168-3-23 ansible_host=192.168.3.23 etcd_member_name=etcd3
+
+[etcd:children]
+kube_control_plane
+
+[kube_node]
+cn-192-168-3-50 ansible_host=192.168.3.50
+cn-192-168-3-51 ansible_host=192.168.3.51
+```
+
+几个要点：
+
+| 项 | 说明 |
+| --- | --- |
+| `[etcd:children] kube_control_plane` | etcd 与控制面同机（stacked etcd），这是标准做法 |
+| `etcd_member_name` | **必须唯一**，是 etcd 集群里的成员标识 |
+| `ansible_host` | Ansible 用来 ssh 的地址 |
+| `ip=` | 节点有多网卡时，指定 K8s 服务绑哪个 IP |
+| 主机名 | 直接用规划好的 `mn-` / `cn-` / `gn-` 命名，装完就能从主机名读出角色和 IP |
+
+<Callout type="trap" title="nginx-proxy 报 ipwrap filter 错误：补 main_access_ip">
+一个真实踩过的坑。执行到写 nginx-proxy 配置这一步时报：
+
+```
+TASK [kubernetes/node : Nginx-proxy | Write nginx-proxy configuration]
+AnsibleFilterError: Unrecognized type <class 'AnsibleUndefined'> for ipwrap filter
+```
+
+原因是某些变量没被解析出来。解法是在 inventory 里补上 `main_access_ip`，值和 `ansible_host` 一致：
+
+```ini
+[kube_control_plane]
+mn-10-0-3-158 ansible_host=10.0.3.158 main_access_ip=10.0.3.158 ip=10.0.3.158 etcd_member_name=etcd1
+```
+</Callout>
+
+## 直接用已验证的配置
+
+kubespray 的 `group_vars` 有几百个变量。从零调是浪费时间，正确做法是拿一份已经在生产上跑过的配置：
+
+```bash
+cp -r ~/k8s-in-action/k8s/kubespray/kubespray-${KUBESPRAY_VERSION}/inventory/mycluster inventory/
+```
+
+然后只改和这套集群相关的那几项：节点列表、网段、`kube_vip_address`、镜像源。逐项含义见下一节《把规划写进配置》。
+
+## 执行部署
+
+```bash
+source .venv/bin/activate
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root cluster.yml
+```
+
+一套三控制面 + 若干工作节点的集群，通常 20–40 分钟。
+
+<Callout type="tip" title="playbook 失败了直接重跑，这是设计如此">
+Ansible 的 task 基本都是幂等的，kubespray 也按这个原则写。所以中途失败（网络抖动、镜像拉取超时）**直接重跑同一条命令**就行，已完成的步骤会被跳过。
+
+不要「手工补一下再继续」—— 手工做的那步不会被记录，下次重跑或升级时状态就不一致了。
+
+如果反复失败在同一个 task 上，加 `-vvv` 看完整报错，那是真问题。
+</Callout>
+
+## 拿 kubeconfig
+
+装完后从**第一个控制面节点**拿：
+
+```bash
+scp mn-192-168-3-21:/root/.kube/config ~/.kube/config
+```
+
+然后把 `server` 地址改成 VIP —— 这一步很关键：
+
+```yaml
+clusters:
+  - cluster:
+      server: https://192.168.3.101:6443    # kube_vip_address，不是某台节点的 IP
+```
+
+直接用节点 IP 的话，那台节点一维护，你的 kubectl 就断了。
+
+## 部署后验收清单
+
+装完别急着交付，逐项确认：
+
+```bash
+# 1. 所有节点 Ready
+kubectl get node -o wide
+
+# 2. 控制面组件全部 Running
+kubectl -n kube-system get pod
+
+# 3. etcd 健康，成员数正确
+kubectl -n kube-system exec -it etcd-mn-192-168-3-21 -- sh -c '
+  ETCDCTL_API=3 etcdctl --cert=/etc/ssl/etcd/ssl/... member list -w table'
+
+# 4. CoreDNS 能解析
+kubectl run -it --rm dns --image=busybox:1.36 -- nslookup kubernetes.default
+
+# 5. Pod 跨节点互通
+kubectl run -it --rm net --image=nicolaka/netshoot -- ping <另一节点上的 Pod IP>
+
+# 6. 证书有效期
+kubeadm certs check-expiration
+
+# 7. 关掉一台控制面，确认 kubectl 仍可用（VIP 漂移生效）
+```
+
+第 7 项最容易被跳过，但它是唯一能验证「高可用真的成立」的方法。装完就测，比出事时才发现 VIP 没配对好得多。
+
+## 只更新指定组件
+
+全量重跑要几十分钟。改一个组件时用 tags：
+
+```bash
+# 看所有可用的 tag
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root cluster.yml --list-tags
+
+# 只更新 coredns
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root cluster.yml --tags=coredns
+```
+
+## 扩容节点
+
+```bash
+# 1. 把新节点加进 inventory 的 [kube_node]
+# 2. 刷新 facts
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root playbooks/facts.yml
+# 3. 只对新节点跑 scale.yml
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root scale.yml --limit=cn-192-168-3-52
+```
+
+<Callout type="warn" title="scale.yml 只用于工作节点">
+扩控制面**不能用 `scale.yml`** —— 它不会正确处理 etcd 成员变更，可能搞坏 etcd 集群。控制面扩缩要用 `recover-control-plane.yml`，详见《控制面扩缩与证书轮转》那一节。
+
+`--limit` 也别忘：不加的话 playbook 会遍历所有节点，虽然幂等但很慢，而且增加了动到存量节点的风险。
+</Callout>
+
+## 卸载
+
+```bash
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root reset.yml
+```
+
+`reset.yml` 会清掉 K8s 相关的一切：容器、配置、CNI 网络、iptables 规则、etcd 数据。**它不做确认提示**，跑错 inventory 就是一次全集群删除 —— 执行前务必确认 `-i` 指向的是哪套集群。
+
+<Quiz
+  id="deploy-1"
+  question="cluster.yml 跑到一半因为镜像拉取超时失败了。最合适的处理是？"
+  options={[
+    { text: '直接重跑同一条命令，已完成的步骤会被跳过', correct: true },
+    { text: '手工在失败的节点上把镜像拉下来，然后跳过这个 task 继续', feedback: '手工做的步骤不会被记录，集群状态与 playbook 的认知就不一致了 —— 下次重跑或升级时会以别的方式暴露出来。' },
+    { text: '先跑 reset.yml 清干净再从头装', feedback: '代价太大。Ansible 的 task 是幂等的，本来就支持断点重跑。' },
+    { text: '改成串行执行再重跑', feedback: '并发不是失败的原因，镜像源才是。真要治本是配好 containerd 的 registry mirror。' },
+  ]}
+  explain={<>幂等是 Ansible 的核心特性，kubespray 也按这个原则设计 —— 中途失败重跑是<strong>预期的使用方式</strong>。要避免的是手工介入：手工补的那一步游离在自动化之外，会让集群实际状态和 playbook 的假设产生偏差，这类偏差往往在下一次升级时才爆出来。如果同一个 task 反复失败，用 <code>-vvv</code> 看完整报错，那才是真问题。</>}
+/>
+
+## 这一节的落点
+
+- kubespray 底下是 kubeadm，出错时要分清是编排层还是 kubeadm 层的问题
+- 装之前先完成三件事：**规划定稿、etcd 盘验收、OS 基线对齐**
+- 用 venv + `requirements.txt` 装 ansible；直接复用已验证的 `group_vars`
+- **失败直接重跑，不要手工补步骤**
+- kubeconfig 的 server 要指向 VIP，不是某台节点
+- 验收清单里第 7 项（关掉一台控制面）是唯一能验证高可用的方法
+- `scale.yml` 只用于工作节点；`reset.yml` 无确认提示，执行前确认 inventory

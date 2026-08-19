@@ -1,0 +1,238 @@
+K8s 有个让新人不适应的地方：你说的话，它不一定马上做；但你说过的话，它会一直记着做。
+
+这不是 bug，是设计。理解 reconcile，就理解了 K8s 的全部脾气。
+
+## 命令式与声明式
+
+```
+命令式（传统运维）
+  "启动 3 个进程"  → 执行 → 结束
+  进程挂了？没人管，因为命令已经执行完了
+
+声明式（K8s）
+  "我要有 3 个副本"  → 写进 etcd → 控制器持续对比
+  进程挂了？实际态 2 ≠ 期望态 3 → 控制器补一个
+```
+
+差别不在语法，在**谁负责维持状态**。命令式里是你，声明式里是控制器。
+
+这带来一个直接后果：**K8s 里没有「执行成功」这个概念，只有「已收敛」和「还没收敛」**。`kubectl apply` 返回 `created` 只意味着对象写进去了，不代表事情办成了。
+
+<Callout type="note" title="这解释了为什么 kubectl apply 那么快">
+`kubectl apply -f deploy.yaml` 通常几十毫秒就返回，而 Pod 可能一分钟后才 Running。
+
+因为 apply 做的只有一件事：把对象写进 etcd。剩下的全是异步的 —— 控制器 watch 到变更、创建 Pod、调度器分配节点、kubelet 拉镜像。
+
+所以在 CI 里写 `kubectl apply && echo "部署成功"` 是错的。要判断真的成了，得用 `kubectl rollout status deploy/xxx --timeout=5m` 去等收敛。
+</Callout>
+
+## spec 与 status：一条清晰的分界线
+
+每个 K8s 对象都有这两块，职责严格分开：
+
+| | 谁写 | 内容 |
+| --- | --- | --- |
+| **spec** | 用户（或上层控制器） | 期望态 —— 我想要什么 |
+| **status** | 控制器 | 实际态 —— 现在是什么 |
+
+```yaml
+spec:
+  replicas: 3              # 我要 3 个 —— 你写的
+status:
+  replicas: 3              # 现在有 3 个 —— 控制器写的
+  readyReplicas: 2         # 其中 2 个就绪
+  unavailableReplicas: 1
+  conditions:
+    - type: Progressing
+      status: "True"
+      reason: NewReplicaSetAvailable
+```
+
+排障时这条分界线非常有用：**看 spec 知道意图，看 status 知道现实，两者的差距就是问题所在**。而 `status.conditions` 里的 `reason` 和 `message` 通常直接写着卡在哪。
+
+```bash
+# 只看 status，跳过一大堆 spec
+kubectl get deploy web -o jsonpath='{.status}' | python3 -m json.tool
+```
+
+## reconcile 循环长什么样
+
+所有控制器都是同一个骨架：
+
+```go
+for {
+    desired := getSpec()          // 从 apiserver 读期望态
+    actual  := getStatus()        // 观察实际态
+
+    if desired != actual {
+        takeAction()              // 只做一步，让它更接近期望
+    }
+    updateStatus()
+}
+```
+
+三个特征值得记住：
+
+1. **幂等** —— 同样的输入跑一百遍，结果一样。所以控制器可以随便重启
+2. **无状态** —— 控制器自己不记东西，每轮都从 apiserver 重新读。所以可以随便换机器跑
+3. **只前进一步** —— 不追求一次到位，靠反复触发收敛
+
+<Callout type="tip" title="这个模式对排障的实际意义">
+既然控制器是幂等且持续重试的，那么：
+
+**把环境改成对的，就不需要「重新执行」任何东西。** PVC 因为权限问题 Pending，权限一放开，下一轮 reconcile 自己就成功了，不用删了重建。
+
+反过来也成立 —— 如果你改完之后等了几分钟还是没动静，那说明你改的不是真正的原因。这比反复删重建有效得多。
+</Callout>
+
+## watch、informer 与 resourceVersion
+
+控制器不轮询 apiserver，它用 **watch**：建立一个长连接，有变更就推过来。
+
+```
+控制器启动
+  ├─ LIST 全量对象，记下当前的 resourceVersion
+  └─ WATCH from resourceVersion —— 只收增量事件
+```
+
+`resourceVersion` 是 etcd 的 revision，单调递增，是整个机制的锚点。
+
+`informer` 是这套机制的标准封装：本地维护一份对象缓存（`Store`），用 watch 保持更新，控制器读缓存而不是每次问 apiserver。所以：
+
+- 控制器的读操作几乎不给 apiserver 压力
+- 但**缓存有滞后**，可能读到几十毫秒前的状态
+- 缓存的内存开销随对象数增长 —— 大集群里这是控制面内存的主要消耗方
+
+<Callout type="warn" title="资源版本过旧：too old resource version">
+控制器断线重连时，如果它记的 `resourceVersion` 已经被 etcd 压缩掉了，apiserver 会返回 `too old resource version`，控制器只能重新 LIST 全量。
+
+平时这没问题。但如果集群里对象很多、又有几十个控制器同时被迫重新 LIST，会造成一次 apiserver 的雪崩式压力 —— 这是大集群里控制面「一挂就连锁挂」的常见机制。
+
+L4 的《规模化》会讲怎么用 APF 限住这种情况。
+</Callout>
+
+## ownerReferences 与级联删除
+
+`kubectl delete deploy web` 之后，ReplicaSet 和 Pod 也一起消失了 —— 这不是 Deployment 控制器主动删的，是 **ownerReferences** 加 **垃圾回收器**的效果。
+
+```yaml
+# Pod 上自动带的
+metadata:
+  ownerReferences:
+    - apiVersion: apps/v1
+      kind: ReplicaSet
+      name: web-7d9f8b6c4
+      uid: 3f2a...
+      controller: true
+      blockOwnerDeletion: true
+```
+
+所有权是一条链：`Deployment → ReplicaSet → Pod`。owner 消失后，垃圾回收器会清掉所有指向它的对象。
+
+```bash
+# 只删 Deployment，留下 Pod（应急时偶尔用得上）
+kubectl delete deploy web --cascade=orphan
+```
+
+<Callout type="trap" title="孤儿对象是排障时的隐形干扰">
+用 `--cascade=orphan` 删过之后，或者手工改过 `ownerReferences` 之后，集群里会留下没人管的 ReplicaSet 和 Pod。
+
+它们不会自愈、不会被更新、也不会随新的 Deployment 一起变化，但**占着资源、抢着 Service 的流量**。
+
+排查「明明改了配置怎么还有老版本在跑」这类问题时，先看一眼：
+
+```bash
+kubectl get pod -o custom-columns='NAME:.metadata.name,OWNER:.metadata.ownerReferences[0].name'
+```
+OWNER 是 `<none>` 的就是孤儿。
+</Callout>
+
+## finalizer：删不掉的对象从哪来
+
+`kubectl delete ns test` 之后 Namespace 一直 `Terminating` —— 这几乎总是 finalizer。
+
+```yaml
+metadata:
+  deletionTimestamp: "2026-08-19T10:00:00Z"   # 删除请求已收到
+  finalizers:
+    - kubernetes.io/pv-protection             # 但这个还没被摘掉
+```
+
+机制是这样的：对象有 finalizer 时，删除请求只会给它打上 `deletionTimestamp`，**不真删**。要等所有 finalizer 被对应的控制器逐个摘掉，对象才真正消失。
+
+这是个保护机制 —— 让控制器有机会先清理外部资源（云上的磁盘、负载均衡器）再放行。
+
+```bash
+# 先搞清楚在等谁
+kubectl get ns test -o jsonpath='{.spec.finalizers}{"\n"}{.status.conditions}'
+
+# 确认对应的控制器为什么没干活，通常是：
+#   - 控制器 Pod 挂了
+#   - 后端资源已经不存在，控制器在无限重试
+```
+
+<Callout type="warn" title="强摘 finalizer 是最后手段，不是常规操作">
+网上到处都是「一行命令解决 Terminating」的答案 —— 直接 patch 掉 finalizer：
+
+```bash
+kubectl patch ns test -p '{"metadata":{"finalizers":[]}}' --type=merge
+```
+
+它确实能让对象消失，但**代价是跳过了清理逻辑**。对 Namespace 来说可能只是留下一些孤儿对象；对 PV 来说，后端存储上的那块卷就永久泄漏了，没人再记得它属于谁。
+
+正确顺序是：先查清在等哪个控制器、它为什么不干活，修好它。只有确认后端资源已经手工清理干净，才强摘。
+</Callout>
+
+## CRD 与 Operator：把运维知识写成控制器
+
+既然所有控制器地位平等（都只是 apiserver 的客户端），你自己写的也一样。这就是 Operator 模式：
+
+```
+CRD          定义新的对象类型，比如 CephCluster
+  +
+Controller   watch 这个类型，把 spec 变成现实
+  =
+Operator     "把某个系统的运维知识编码成控制器"
+```
+
+集群里已经装的这些都是 Operator：GPU Operator、cert-manager、Rook、Prometheus Operator。
+
+<Callout type="tip" title="用 CRD 判断一个组件是不是 Operator">
+```bash
+kubectl get crd
+kubectl api-resources --api-group=nvidia.com
+```
+装了 CRD 的组件基本都在用这个模式。排查它们的问题时，套路和排查 Deployment 完全一样：看自定义对象的 `status.conditions`，看对应控制器 Pod 的日志。不需要为每个 Operator 学一套新方法。
+</Callout>
+
+<Quiz
+  id="decl-1"
+  question="一个 PV 长时间处于 Terminating。以下处理方式，哪个是对的？"
+  options={[
+    { text: '先查在等哪个 finalizer、对应控制器为什么没干活，确认后端卷已清理再考虑强摘', correct: true },
+    { text: '直接 patch 掉 finalizers，最快', feedback: '能让对象消失，但跳过了清理逻辑 —— 后端存储上那块卷会永久泄漏，没人再知道它属于谁。' },
+    { text: '重启 apiserver', feedback: 'finalizer 是对象上的字段，重启 apiserver 不改变它，也不会让控制器去摘。' },
+    { text: '等它自己超时消失', feedback: 'finalizer 没有超时机制。控制器不摘，它就永远不消失。' },
+  ]}
+  explain={<>finalizer 的存在意义就是「先清理外部资源，再放行删除」。PV 的 finalizer 通常在等 CSI 把后端的卷真正删掉。强摘等于把这一步跳过 —— 集群里对象干净了，存储后端上却多了一块无主的卷。正确做法是先查 <code>kubectl describe pv</code> 与 CSI controller 日志，找出它卡在哪。</>}
+/>
+
+<Quiz
+  id="decl-2"
+  question="关于 spec 和 status，下面哪些说法正确？"
+  options={[
+    { text: 'spec 由用户写，status 由控制器写', correct: true },
+    { text: 'status.conditions 里的 reason / message 常常直接写明了卡在哪', correct: true },
+    { text: '两者的差距就是控制器接下来要做的事', correct: true },
+    { text: '手工改 status 是修复问题的常规手段', feedback: 'status 是控制器对现实的观察结果，改它不改变现实 —— 下一轮 reconcile 就被覆盖回去了。' },
+  ]}
+  explain={<>这条分界线是排障的基本工具：spec 告诉你意图，status 告诉你现实，conditions 告诉你原因。反过来，试图通过改 status 来「修好」什么是无效的 —— 那只是改了一份观察记录，现实没变，控制器下一轮就写回去了。</>}
+/>
+
+## 这一节的落点
+
+- `apply` 返回成功只代表写进了 etcd，判断收敛要用 `rollout status`
+- **看 spec 知意图，看 status 知现实，看 conditions 知原因**
+- 控制器幂等且持续重试 —— **把环境改对就够了，不需要重新执行**；改完不动就说明没改对
+- 删不掉的对象看 finalizer，强摘之前先确认外部资源已清理
+- 所有控制器地位平等，排查 Operator 和排查 Deployment 是同一套套路

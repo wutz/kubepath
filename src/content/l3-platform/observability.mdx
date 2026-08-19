@@ -1,0 +1,230 @@
+监控装了一堆面板，出事时还是不知道看哪个。
+
+原因通常不是工具不好，而是**没先定义「什么算不正常」**。这一节先定指标，再谈部署。
+
+## 三层指标，各自回答不同的问题
+
+```
+控制面    集群还能接受变更吗
+节点      机器还健康吗、还有余量吗
+工作负载  业务本身跑得好吗
+```
+
+一个故障的典型传导路径是自下而上或自上而下贯穿这三层，所以三层都要有数，只看一层会误判。
+
+### 控制面必看
+
+| 指标 | 阈值 | 意味着 |
+| --- | --- | --- |
+| `etcd_disk_wal_fsync_duration_seconds` p99 | **< 10ms** | 超了整个集群会「发黏」 |
+| `etcd_disk_backend_commit_duration_seconds` p99 | < 25ms | boltdb 刷盘压力 |
+| `etcd_server_leader_changes_seen_total` | **增量 = 0** | 在涨就是磁盘或网络有问题 |
+| `etcd_mvcc_db_total_size_in_bytes` | < 配额的 70% | 接近就要 compact + defrag |
+| `apiserver_request_duration_seconds` p99 | < 1s（读） | 慢了先看谁在 list |
+| `apiserver_current_inflight_requests` | 远低于上限 | 打满会开始拒绝请求 |
+
+```promql
+histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m]))
+increase(etcd_server_leader_changes_seen_total[15m])
+etcd_mvcc_db_total_size_in_bytes / etcd_server_quota_backend_bytes
+
+# 谁在制造昂贵的 list 请求 —— 大集群里这是控制面压力的主要来源
+topk(10, sum by (resource, verb, client) (
+  rate(apiserver_request_total{verb=~"LIST|GET"}[5m])))
+```
+
+<Callout type="tip" title="etcd 的 fsync 是整个集群最值得盯的一个数">
+L0 和 L2 都强调过，这里给出监控形态：**告警设在 50–100ms，而不是官方的 500ms**。
+
+官方阈值（warning 500ms / critical 1s）是「已经很糟」的水位，等它响的时候集群已经难用了。而验收线是 p99 < 10ms，所以 50ms 是一个既有提前量、又不会天天误报的位置。
+
+配套要看 `leader_changes` 的增量 —— 两者一起涨，基本可以确定是磁盘。
+</Callout>
+
+### 节点必看
+
+| 指标 | 阈值 |
+| --- | --- |
+| `kube_node_status_condition{condition="Ready"}` | == 1 |
+| `kube_node_status_condition{condition="DiskPressure"}` | **== 0** |
+| `kube_node_status_condition{condition="MemoryPressure"}` | == 0 |
+| 文件系统使用率 | < 80% |
+| conntrack 使用率 | < 80% |
+| requests 分配率 | < 85%（超了调度不进新 Pod） |
+
+```promql
+# 磁盘水位 —— L2 的 NotReady 闯关就是这个没配
+(1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) > 0.8
+
+# conntrack 打满会导致随机连接失败，而 CPU/内存/带宽全都正常
+node_nf_conntrack_entries / node_nf_conntrack_entries_limit > 0.8
+
+# CPU requests 分配率 —— 判断还能不能调进 Pod，看这个不是看使用率
+sum by (node) (kube_pod_container_resource_requests{resource="cpu"})
+  / sum by (node) (kube_node_status_allocatable{resource="cpu"})
+```
+
+### 工作负载必看
+
+```promql
+# 重启：最直接的健康信号
+increase(kube_pod_container_status_restarts_total[15m]) > 3
+
+# OOMKilled —— 查这个容器的 limits
+kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+
+# Pending 超过 5 分钟 —— 调度问题
+kube_pod_status_phase{phase="Pending"} == 1
+
+# 被 CPU 限流 —— L1 讲过：延迟毛刺而 CPU 使用率看着很低
+rate(container_cpu_cfs_throttled_periods_total[5m])
+  / rate(container_cpu_cfs_periods_total[5m]) > 0.25
+
+# PVC 使用率
+kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > 0.85
+```
+
+<Callout type="warn" title="CPU 限流是最容易被忽略的一类性能问题">
+`container_cpu_cfs_throttled_periods_total` 这个指标值得单独做一块面板。
+
+因为限流的表现极具误导性：**P99 延迟有毛刺、健康检查偶发超时，而 CPU 使用率平均下来可能只有 30%**。所有人都会去查网络、查数据库，很少有人第一时间想到 limits 卡太死。
+
+有了这个指标，判断就是一秒钟的事。
+</Callout>
+
+## 部署
+
+```bash
+# VictoriaMetrics：兼容 Prometheus 生态，资源开销明显更低
+# 先改 values.yml：
+#   grafana.adminPassword
+#   grafana.ingress.hosts 与 tls.hosts
+
+helmwave up --build
+
+# 装 Prometheus 的 CRD，这样社区的 ServiceTaskList / PrometheusRule 能直接用
+kubectl apply -k prometheus
+```
+
+访问 `https://gf.k8s1.zw1.paratera.com`（前面配的域名，走 L3《服务暴露》那一套 Ingress + cert-manager）。
+
+<Callout type="note" title="为什么用 VictoriaMetrics 而不是 Prometheus">
+两者的查询语言和生态兼容（PromQL、ServiceMonitor、Grafana 面板都能直接用），差别在资源开销和运维模型：
+
+- **内存占用显著更低** —— 同样的时间线数量，VM 通常只要 Prometheus 的三分之一到一半
+- **存储压缩率更好** —— 长期留存的成本低得多
+- **原生支持集群模式** —— 水平扩展不需要 Thanos / Cortex 这一层
+
+在 GPU 集群这类时间线特别多的场景（每张卡几十个指标 × 上百张卡），这个差距很明显。
+</Callout>
+
+### 日志
+
+```bash
+# VictoriaLogs（底层 fluent-bit）—— 与 VM 同栈
+# 或 Loki（底层 promtail）—— 需要对象存储支持
+
+# Grafana 查 VictoriaLogs 需要单独装 plugin
+```
+
+| | VictoriaLogs | Loki |
+| --- | --- | --- |
+| 采集器 | fluent-bit | promtail |
+| 存储依赖 | 本地或对象存储 | **建议对象存储** |
+| 查询灵活性 | 更灵活（不强依赖标签基数） | 依赖标签设计，标签设计不好很难查 |
+
+Loki 的模型要求日志的「维度」都做成标签，而标签基数一高性能就崩 —— 实践中经常出现「日志收上来了但查不出想要的」。VictoriaLogs 在这方面限制少一些。
+
+### 事件采集
+
+```bash
+# kubernetes-event-exporter：把 K8s Event 写进日志系统
+```
+
+这一项容易被忽略但很有价值：**Event 默认只在 etcd 里留 1 小时**。故障复盘时最需要的恰恰是「一小时前发生了什么」，而那时候 Event 已经没了。
+
+采集到日志系统之后，Event 就有了长期留存，事后能完整重建时间线。
+
+## 告警设计：三条原则
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata: { name: cluster-critical }
+spec:
+  groups:
+    - name: etcd
+      rules:
+        - alert: EtcdHighFsyncDuration
+          expr: histogram_quantile(0.99,
+                  rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])) > 0.05
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "etcd WAL fsync p99 {{ $value }}s 超过 50ms"
+            runbook: "查磁盘 I/O；确认 etcd 数据目录独占 NVMe"
+```
+
+1. **可动作** —— 每条告警的 annotation 里必须写「收到之后做什么」。写不出来的告警应该删掉
+2. **有合适的 `for`** —— 瞬时抖动不该叫人起床。控制面类 5–10 分钟，业务类 2–5 分钟
+3. **不重复** —— 一个节点故障不应该同时触发二十条告警。用 `severity` 分级，只让根因级别的告警呼人
+
+<Callout type="trap" title="告警太多等于没有告警">
+一个真实的失效模式：值班群里每天几百条告警，大家逐渐学会了忽略。真出事那条淹在里面。
+
+判断标准很简单：**如果一条告警从来没有人因为它做过任何事，它就该被删掉或降级成看板指标。**
+
+建议的分层：
+- **呼人（critical）** —— 集群不可用、数据面故障。控制在每周几条以内
+- **值班时间处理（warning）** —— 水位告警、性能退化
+- **只上看板** —— 趋势类、容量规划类
+</Callout>
+
+## 必备面板
+
+按排障顺序组织，而不是按数据来源：
+
+| 面板 | 内容 | 什么时候看 |
+| --- | --- | --- |
+| **集群总览** | 节点状态、Pod 分布、资源分配率 | 第一眼 |
+| **控制面健康** | etcd fsync / DB size / leader changes、apiserver 延迟与 inflight | 集群变慢 |
+| **节点详情** | CPU/内存/磁盘/网络、conntrack、Pod 密度 | 某节点异常 |
+| **工作负载** | 重启、OOM、**CPU 限流**、Pending | 业务异常 |
+| **存储** | PVC 使用率、CSI 操作延迟与错误 | 挂载或容量问题 |
+| **容量规划** | requests 分配率趋势、Pod 数趋势、IP 池用量 | 每月一次 |
+
+最后一个面板是**主动**用的：它回答「照现在的增速，什么时候会撞上哪条限制」（L4 容量计算器算的那四条）。等撞上再规划就晚了。
+
+<Quiz
+  id="o11y-1"
+  question="一个服务 P99 延迟有毛刺、健康检查偶发超时，但 CPU 使用率平均只有 30%。最该看哪个指标？"
+  options={[
+    { text: 'container_cpu_cfs_throttled_periods_total —— CPU 限流比例', correct: true },
+    { text: '节点的 CPU 使用率', feedback: '题目已经说了平均 30%，节点级的数只会更平滑，更看不出问题。' },
+    { text: '网络丢包率', feedback: '值得排除，但「毛刺 + 使用率低」这个组合是 CPU 限流的典型指纹，应该先看它。' },
+    { text: 'PVC 使用率', feedback: '存储容量与延迟毛刺没有直接关系。' },
+  ]}
+  explain={<>CPU 限流是按 100ms 周期硬切的：进程在每个周期内被掐断，产生毫秒级的延迟尖峰，但<strong>平均下来使用率很低</strong> —— 因为它被限制在了 limits 以内。这个组合非常有指纹特征。查 <code>throttled_periods / periods</code> 的比值，超过 25% 就说明 limits 卡太死了。这也是 L1 建议「内存 limits 严格、CPU limits 放宽」的实证依据。</>}
+/>
+
+<Quiz
+  id="o11y-2"
+  question="关于告警设计，下面哪些说法正确？"
+  options={[
+    { text: '每条告警的 annotation 里应该写清收到之后做什么', correct: true },
+    { text: '从来没人因它做过任何事的告警应该删掉或降级', correct: true },
+    { text: 'etcd fsync 的告警应该设在 50–100ms，而不是官方的 500ms', correct: true },
+    { text: '告警越全越好，宁可多报不可漏报', feedback: '这是最常见的误区。告警太多会训练出「忽略告警」的习惯，真出事那条就被淹没了 —— 结果是漏报更严重。' },
+  ]}
+  explain={<>告警的价值取决于信噪比，不是覆盖率。官方的 etcd 阈值（500ms/1s）是「已经很糟」的水位，而验收线是 10ms —— 所以 50ms 既有提前量又不会天天误报。分层是关键：critical 呼人（每周几条以内）、warning 值班时间处理、趋势类只上看板。</>}
+/>
+
+## 这一节的落点
+
+- 先定义「什么算不正常」，再谈装什么工具
+- **控制面盯 etcd fsync（告警 50ms，不是 500ms）+ leader changes + DB size + apiserver 延迟**
+- 节点盯 `DiskPressure`、文件系统水位、conntrack、**requests 分配率**（不是使用率）
+- 工作负载盯重启、OOM、Pending，以及**最容易被忽略的 CPU 限流**
+- 采集 K8s Event 到日志系统 —— 默认只留 1 小时，复盘时正好需要它
+- 告警三原则：**可动作、有合适的 `for`、不重复**；没人处理过的告警该删
+- 容量规划面板是主动用的：算出还有多久撞上哪条限制

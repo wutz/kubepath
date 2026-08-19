@@ -1,0 +1,212 @@
+几百个节点同时拉一个 10G 的镜像，仓库和网络会先倒下。
+
+这不是假设 —— 一次大规模训练任务启动、或者一次全集群 DaemonSet 更新，就是这个场景。而 AI 镜像动辄十几 GB。
+
+## 先选仓库：Registry 还是 Harbor
+
+| | **Registry**（默认） | **Harbor**（备选） |
+| --- | --- | --- |
+| 组件 | `registry` + UI，单 Deployment + 单 PVC | core / jobservice / portal / registry + PostgreSQL + Redis |
+| 认证 | htpasswd 基本认证，单一账号池 | 用户 / 项目 / 角色 RBAC，可对接 LDAP、OIDC |
+| 多租户 | **无项目隔离** —— 登录账号默认可 pull / push / delete | 项目级权限与配额 |
+| 上游代理缓存 | **不支持**，镜像要逐个手工同步 | 支持 proxy cache（`docker.io` / `gcr.io` / `nvcr.io`） |
+| 漏洞扫描 / 签名 | 无 | Trivy 扫描 + 镜像签名 |
+| 跨机房复制 | 无 | 支持 |
+| 保留策略 / 审计 | 无 | 支持 |
+| 资源开销 | 低 | 高，生产建议外接 PostgreSQL 与 Redis |
+
+**默认选 Registry**：单集群内部使用、账号可控、只需要 push / pull / delete，那就没必要养一套 Harbor。
+
+换 Harbor 的判断条件很明确 —— 出现下面任一项：
+
+- 需要多团队/多项目隔离与 RBAC，并对接 LDAP / OIDC
+- 需要**上游代理缓存**，替代逐个手工同步上游镜像
+- 需要漏洞扫描、镜像签名、保留策略或跨机房复制
+- 需要统一托管 Helm Chart 等 OCI 制品
+
+<Callout type="tip" title="proxy cache 往往是换 Harbor 的决定性理由">
+手工同步上游镜像是个持续的负担：业务方要一个新镜像，就得有人 `skopeo copy` 一次，还要记得同步新 tag。
+
+Harbor 的 proxy cache 让 `docker.io/library/nginx` 这样的地址在第一次拉取时自动缓存到本地 —— 之后所有节点都从本地拉。对接 `nvcr.io`（NVIDIA 的镜像库，AI 镜像都在那）时价值尤其大，因为那些镜像又大又常更新。
+</Callout>
+
+## 凭据配置：两个层面
+
+### 节点层（推荐）
+
+L2《把规划写进配置》讲过：镜像源配在 containerd，业务清单里照常写 `nginx:1.27`。
+
+```yaml
+# group_vars/all/containerd.yml
+containerd_registries_mirrors:
+  - prefix: docker.io
+    mirrors:
+      - host: https://cr.k8s1.zw1.paratera.com/v2/docker.io
+        capabilities: ["pull", "resolve"]
+        skip_verify: false
+        override_path: true
+```
+
+私有仓库需要认证时，配在节点的 containerd 里，业务侧完全不用管凭据。
+
+### Pod 层
+
+```bash
+kubectl create secret docker-registry regcred \
+  --docker-server=cr.k8s1.zw1.paratera.com \
+  --docker-username=<user> --docker-password=<pass> \
+  -n team-a
+```
+
+```yaml
+spec:
+  imagePullSecrets:
+    - name: regcred
+```
+
+<Callout type="warn" title="imagePullSecrets 是命名空间级的，新命名空间要重新建">
+最常见的现象是：在 default 里跑得好好的镜像，换到新命名空间就 `ImagePullBackOff`。
+
+Secret 不跨命名空间。三种处理方式：
+
+```bash
+# 1. 把 Secret 挂到默认 ServiceAccount 上，该命名空间的 Pod 自动带上
+kubectl patch sa default -n team-a \
+  -p '{"imagePullSecrets":[{"name":"regcred"}]}'
+
+# 2. 用 kyverno / reflector 这类工具自动同步到所有命名空间
+
+# 3. 最省事：把凭据配在节点的 containerd 里，根本不需要 Pod 级 Secret
+```
+第 3 种最适合「全集群共用一个私有仓库」的场景 —— 这也是推荐节点层配置的原因。
+</Callout>
+
+## 镜像 P2P：解决并发拉取
+
+仓库配好之后，真正的规模问题才出现：**N 个节点同时拉同一个大镜像，仓库的出口带宽是 1/N**。
+
+P2P 的思路是让节点之间互相传：
+
+| | **Spegel**（默认） | **Dragonfly**（备选） |
+| --- | --- | --- |
+| 原理 | 节点间共享**已有的镜像层** | 完整的 P2P 分发网络 |
+| 依赖 | **只支持 containerd** | 不限运行时 |
+| 组件 | 轻量，一个 DaemonSet | 较重（manager / scheduler / seed peer） |
+| 预热 | 不支持 | **支持 preheat** |
+| 非镜像文件 | 不支持 | **支持**（模型权重等） |
+
+```bash
+# Spegel 随 base 基础服务一起部署
+helmwave up --build
+```
+
+<Callout type="trap" title="Spegel 依赖 containerd_discard_unpacked_layers: false">
+这是个隐蔽的依赖。L2《把规划写进配置》里提到过这个参数：设成 `true` 能省磁盘（丢掉解包后不再需要的原始层）。
+
+但 Spegel 的工作原理正是**把本节点已有的层分享给其它节点** —— 层被丢掉了就没东西可分享，P2P 静默失效，看起来装了但不起作用。
+
+```yaml
+# group_vars/all/containerd.yml
+containerd_discard_unpacked_layers: false
+```
+这类跨组件的隐式依赖，是「按文档装完了但没效果」的常见成因。
+</Callout>
+
+### 什么时候该用 Dragonfly
+
+两个场景 Spegel 覆盖不了：
+
+1. **需要预热** —— 大规模训练前先把镜像推到所有节点，而不是等任务启动时才拉
+2. **分发非镜像文件** —— 模型权重文件动辄几十上百 GB，用 P2P 分发比所有节点去拉对象存储快得多
+
+第 2 点在 AI 平台上价值很大：一个 70B 模型的权重 140GB，100 个推理节点同时从对象存储拉，那是 14TB 的流量。
+
+## 离线环境
+
+内网无外网出口时，要准备三类源：
+
+```bash
+# 1. 容器镜像：用 skopeo 批量同步
+skopeo copy docker://docker.io/library/nginx:1.27 \
+  docker://cr.k8s1.zw1.paratera.com/library/nginx:1.27
+
+# 批量：把清单里的镜像列出来逐个同步
+kubectl get pod -A -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' \
+  | sort -u > images.txt
+
+# 2. PyPI 镜像
+# 3. Conda 镜像
+```
+
+kubespray 侧还有 `group_vars/all/offline.yml`，把二进制包和镜像的下载地址全指向内网。
+
+<Callout type="note" title="离线环境最容易漏的是「间接依赖」">
+自己的业务镜像都同步了，但漏掉的往往是：
+
+- Helm chart 里第三方组件的镜像（`initContainers` 里的、sidecar 的）
+- Operator 动态拉起的镜像（GPU Operator 会拉驱动镜像、CSI 会拉 registrar）
+- 镜像的**多架构 manifest** —— 只同步了 amd64，arm 节点上就拉不到
+
+处理方式：装完一遍之后跑上面那条命令导出集群里实际用到的所有镜像，作为离线清单的基线。**靠读文档列清单一定会漏。**
+</Callout>
+
+## 镜像瘦身与拉取策略
+
+P2P 解决的是分发，但源头上小一点更好：
+
+| 做法 | 效果 |
+| --- | --- |
+| 多阶段构建 | 构建工具链不进最终镜像，常能省一半以上 |
+| 选对基础镜像 | `alpine` / `distroless` 比 `ubuntu` 小一个量级 |
+| 合并 RUN 层、清理缓存 | 避免「删除的文件还在下层」 |
+| **共享基础层** | 团队统一基础镜像，节点上只需缓存一份 |
+
+最后一条常被忽略但收益最大：L0 讲过镜像分层与写时复制 —— 十个服务用同一个基础镜像，那些层在节点上只占一份空间、只需要拉一次。
+
+```yaml
+imagePullPolicy: IfNotPresent    # 生产用这个，配合明确的版本 tag
+# imagePullPolicy: Always        # 只在用 :latest 时才需要，而生产不该用 latest
+```
+
+<Callout type="warn" title="生产环境不要用 latest tag">
+两个问题：
+
+1. **不可重现** —— 同一份清单在不同时间部署出不同的东西，回滚也回不到确定的版本
+2. **配合 `Always` 会放大拉取压力** —— 每次 Pod 重启都要访问仓库校验，几百个 Pod 同时重启时仓库被打满
+
+用明确的版本 tag 或 digest，配 `IfNotPresent`。需要「总是最新」的场景应该走 CI 更新清单里的 tag，而不是依赖 `latest`。
+</Callout>
+
+<Quiz
+  id="reg-1"
+  question="装了 Spegel 但 P2P 看起来没生效，节点还是各自从仓库拉。最可能的原因？"
+  options={[
+    { text: 'containerd 配了 discard_unpacked_layers: true，层被丢掉了没东西可分享', correct: true },
+    { text: 'Spegel 需要 Harbor 才能工作', feedback: 'Spegel 工作在节点的 containerd 层，与用哪个仓库无关。' },
+    { text: '需要配 imagePullSecrets', feedback: '凭据影响的是能否从仓库拉取，与节点间 P2P 分享无关。' },
+    { text: 'Spegel 只在同一机架内生效', feedback: '没有这个限制，它基于节点间的 P2P 发现。' },
+  ]}
+  explain={<>Spegel 的原理是把本节点 containerd 里<strong>已有的镜像层</strong>分享给其它节点。<code>discard_unpacked_layers: true</code> 会在解包后丢掉原始层以省磁盘 —— 于是没有层可以分享，P2P 静默失效。这是一个典型的跨组件隐式依赖：两边配置各自都「合理」，组合起来功能就没了。装 Spegel 前要确认这个参数是 <code>false</code>。</>}
+/>
+
+<Quiz
+  id="reg-2"
+  question="什么情况下应该从 Registry 换成 Harbor？"
+  options={[
+    { text: '需要上游镜像的 proxy cache，替代逐个手工同步', correct: true },
+    { text: '需要多团队项目隔离与 RBAC，对接 LDAP/OIDC', correct: true },
+    { text: '需要漏洞扫描、镜像签名或跨机房复制', correct: true },
+    { text: '镜像数量比较多', feedback: '数量本身不是理由 —— Registry 存几万个镜像没问题，瓶颈是存储容量而不是软件能力。' },
+  ]}
+  explain={<>换 Harbor 的理由都是<strong>能力性</strong>的，不是容量性的：多租户隔离、proxy cache、扫描签名、跨机房复制。代价是从「单 Deployment + 单 PVC」变成一套带 PostgreSQL 和 Redis 的系统，生产还建议外接数据库。所以没有这些需求时，Registry 是更省心的选择。</>}
+/>
+
+## 这一节的落点
+
+- **默认 Registry**，出现多租户 / proxy cache / 扫描签名 / 跨机房复制的需求才换 Harbor
+- 凭据优先配在 **containerd 节点层**，避免每个命名空间都建 `imagePullSecrets`
+- `imagePullSecrets` 不跨命名空间；挂到默认 SA 上是最简单的兜底
+- **Spegel 依赖 `containerd_discard_unpacked_layers: false`**，否则静默失效
+- 需要预热或分发模型权重等非镜像文件 → 用 Dragonfly
+- 离线清单从**实际运行的集群导出**，靠读文档一定会漏
+- 生产不用 `latest`；统一基础镜像能让节点上的层只存一份

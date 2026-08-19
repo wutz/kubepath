@@ -1,0 +1,250 @@
+工作负载类型选错，后面所有事情都会别扭：滚动更新不受控、扩容之后数据串了、Pod 重建之后连不上了。
+
+而选型的判断依据其实只有三个问题：**副本之间是否等价？需不需要稳定的身份？跑完是否要退出？**
+
+## 选型决策
+
+| 问题 | 是 | 否 |
+| --- | --- | --- |
+| 跑完就退出？ | **Job / CronJob** | 往下 |
+| 每个节点都要来一个？ | **DaemonSet** | 往下 |
+| 副本之间需要区分身份（各自独立的存储、固定的网络名）？ | **StatefulSet** | **Deployment** |
+
+绝大多数无状态服务是 Deployment，这没什么可犹豫的。真正需要想清楚的是另外三类。
+
+## Pod：最小调度单位
+
+Pod 不是「一个容器」，是**一组共享 namespace 的容器**。共享的是 network、ipc、uts，各自独立的是 mnt 和 pid（默认）。
+
+三种多容器模式：
+
+```yaml
+spec:
+  initContainers:              # 1. init：按顺序跑完才启动主容器
+    - name: wait-for-db        #    用于等依赖、改权限、下载配置
+      image: busybox
+      command: ['sh','-c','until nc -z db 5432; do sleep 2; done']
+
+  containers:
+    - name: app                # 2. sidecar：与主容器并行，共享网络与卷
+    - name: log-shipper        #    日志采集、代理、证书轮转
+```
+
+```yaml
+  # 3. 原生 sidecar（1.29 GA）：写成 restartPolicy: Always 的 initContainer
+  initContainers:
+    - name: proxy
+      image: envoy
+      restartPolicy: Always    # ← 这一行让它变成 sidecar
+```
+
+<Callout type="tip" title="原生 sidecar 解决了两个老问题">
+把 sidecar 写成普通 container 有两个长期的痛点：
+
+1. **启动顺序不保证** —— 主容器可能在代理 sidecar 就绪之前就开始发请求，然后失败重启
+2. **Job 永远完不成** —— 主容器退出了，sidecar 还在跑，Job 卡在 Running
+
+`restartPolicy: Always` 的 initContainer（1.29 GA）同时解决了这两个：它保证在主容器之前就绪，且在主容器退出后被自动终止。有 sidecar 的场景优先用这个写法。
+</Callout>
+
+## Deployment：滚动更新的实际行为
+
+Deployment 自己不管 Pod，它管 ReplicaSet：
+
+```
+Deployment web
+  ├─ ReplicaSet web-7d9f8b6c4   （新版本，replicas: 3）
+  └─ ReplicaSet web-5c8b7a9d2   （旧版本，replicas: 0，留着给回滚用）
+```
+
+更新策略的两个参数决定了发布过程的形状：
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 25%    # 最多允许多少个不可用
+    maxSurge: 25%          # 最多允许超出期望副本数多少个
+```
+
+| 配置 | 效果 | 适合 |
+| --- | --- | --- |
+| `maxUnavailable: 0`, `maxSurge: 1` | 先起新的再停旧的，容量不下降 | 生产，资源有余量 |
+| `maxUnavailable: 1`, `maxSurge: 0` | 先停后起，不额外占资源 | 资源紧张，能容忍容量下降 |
+| `type: Recreate` | 全停再全起，有中断 | 单例、不支持多版本共存的应用 |
+
+```bash
+kubectl rollout status deploy/web --timeout=5m   # 等收敛，CI 里必须用这个
+kubectl rollout history deploy/web              # 看历史版本
+kubectl rollout undo deploy/web                 # 回滚上一版
+kubectl rollout undo deploy/web --to-revision=3
+```
+
+<Callout type="warn" title="滚动更新不等于零中断">
+`maxUnavailable: 0` 只保证「Ready 的 Pod 数不低于期望值」，它保证不了连接不断。要真正做到无损，还差三件事：
+
+1. **readinessProbe 要准** —— 探针通过就会接流量，如果应用还没热起来（连接池、JIT、缓存预热），就会有一批失败请求
+2. **preStop + 优雅终止** —— Pod 被删时要先从 Service 摘掉、处理完在途请求再退出。`terminationGracePeriodSeconds` 要大于实际处理时间
+3. **PodDisruptionBudget** —— 防止节点维护（drain）时把副本一次带走太多
+
+这三件缺一件，「滚动更新」就只是「滚动重启」。
+</Callout>
+
+## StatefulSet：稳定身份意味着什么
+
+StatefulSet 给每个副本三样固定的东西：
+
+```
+Pod 名        web-0, web-1, web-2        （不是随机后缀）
+DNS 名        web-0.web.default.svc.cluster.local
+存储          每个 Pod 一个独立 PVC，重建后重新绑回原来那个
+```
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: web }
+spec:
+  serviceName: web            # 必须配一个 Headless Service，DNS 名靠它
+  replicas: 3
+  podManagementPolicy: OrderedReady   # 默认：0 就绪才起 1
+  volumeClaimTemplates:               # 每个副本一个 PVC，自动创建
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 100Gi } }
+```
+
+四个和 Deployment 明显不同的行为：
+
+| 行为 | Deployment | StatefulSet |
+| --- | --- | --- |
+| 创建顺序 | 并行 | 默认按 0→1→2 顺序，前一个 Ready 才起下一个 |
+| 删除顺序 | 并行 | 逆序 2→1→0 |
+| Pod 重建后名字 | 变 | **不变** |
+| 缩容后的 PVC | — | **保留**，不自动删 |
+
+<Callout type="trap" title="缩容之后 PVC 还在，扩容回去数据会接上">
+StatefulSet 从 5 缩到 3，`web-3` 和 `web-4` 的 PVC **不会被删除**（这是刻意的保护）。
+
+之后扩容回 5，新起的 `web-3` 会**绑回原来那个 PVC**，读到的是缩容前的老数据。
+
+这个行为在有状态服务里通常正是你想要的（节点维护后数据还在），但在「先缩容清理再扩容」的场景里就是个陷阱 —— 以为清空了，其实老数据还在。缩容后要真清理，得手工删 PVC。
+</Callout>
+
+## DaemonSet
+
+每个（匹配的）节点跑一个，用于系统级组件：CNI、CSI node plugin、日志采集、监控 agent、GPU device plugin。
+
+```yaml
+spec:
+  template:
+    spec:
+      tolerations:                    # 关键：要能容忍所有污点
+        - operator: Exists            # 否则控制面节点和专用节点上不会有它
+      nodeSelector:
+        node-role.kubernetes.io/gpu: ""   # 只在 GPU 节点上跑
+```
+
+<Callout type="note" title="DaemonSet 是 drain 的常见拦路虎">
+`kubectl drain` 默认会因为 DaemonSet Pod 而拒绝执行，必须加 `--ignore-daemonsets`。
+
+这是合理的 —— DaemonSet 就是要在每个节点上跑，驱逐它没有意义（控制器会立刻再建一个）。但要注意顺序：CSI node plugin 也是 DaemonSet，它被提前干掉的话，本来要迁走的有状态 Pod 就卸载不了卷了。
+</Callout>
+
+## Job 与 CronJob
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+spec:
+  completions: 10          # 一共要成功 10 次
+  parallelism: 3           # 同时最多跑 3 个
+  backoffLimit: 4          # 失败重试上限，超了 Job 判定为 Failed
+  ttlSecondsAfterFinished: 3600   # 完成后 1 小时自动清理
+  template:
+    spec:
+      restartPolicy: Never  # Job 只能是 Never 或 OnFailure
+```
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid       # 上一次没跑完就跳过这次
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+```
+
+<Callout type="warn" title="ttlSecondsAfterFinished 不配，etcd 会被慢慢填满">
+Job 完成后默认**不会自己消失**，Pod 对象也留着。每天几百个 CronJob 实例，跑一年就是十几万个对象堆在 etcd 里。
+
+后果是 etcd 数据库膨胀触发 `mvcc: database space exceeded`，然后整个集群拒绝写入。L2 的《etcd 运维》讲怎么救，但更省事的是一开始就配上 `ttlSecondsAfterFinished` 和 `successfulJobsHistoryLimit`。
+</Callout>
+
+## ConfigMap 与 Secret 的热更新边界
+
+这是一个被广泛误解的点：
+
+| 挂载方式 | 更新后容器里会变吗 |
+| --- | --- |
+| `volumeMounts` 挂成文件 | **会**，约 1 分钟内（kubelet 同步周期），但应用得自己重读 |
+| `env` / `envFrom` 注入环境变量 | **不会**，环境变量在进程启动时就定了 |
+| `subPath` 挂单个文件 | **不会**，这是个经典陷阱 |
+
+```yaml
+# 想要热更新：整个挂成目录
+volumeMounts:
+  - name: config
+    mountPath: /etc/app        # ✓ 会更新
+
+# 不会更新：用了 subPath
+volumeMounts:
+  - name: config
+    mountPath: /etc/app/config.yaml
+    subPath: config.yaml       # ✗ 永远是创建时的那份
+```
+
+<Callout type="tip" title="要确定性的重启，给 Pod 打配置的 hash">
+与其依赖热更新，不如让配置变更明确地触发一次滚动更新：
+
+```yaml
+metadata:
+  annotations:
+    checksum/config: "{{ sha256sum配置内容 }}"
+```
+annotation 一变，Pod template 就变，Deployment 自然触发滚动更新。Helm 里这是标准做法，kustomize 的 `configMapGenerator` 则通过给 ConfigMap 名字加 hash 后缀达到同样效果。
+</Callout>
+
+<Quiz
+  id="obj-1"
+  question="一个 MySQL 主从集群要跑在 K8s 上，每个实例需要独立的数据盘，且从库要能通过固定地址找到主库。应该用哪种工作负载？"
+  options={[
+    { text: 'StatefulSet + Headless Service', correct: true },
+    { text: 'Deployment + 共享 PVC', feedback: '副本会抢同一个 PVC —— 块存储跨节点会写坏数据，而且 Pod 名随机，从库找不到固定的主库地址。' },
+    { text: 'DaemonSet', feedback: 'DaemonSet 是每节点一个，副本数由节点数决定，不适合固定实例数的数据库。' },
+    { text: '三个独立的 Deployment，各配一个 PVC', feedback: '能凑出来，但要手工维护三份几乎相同的清单，扩容和滚动更新都得手动做 —— StatefulSet 就是为此设计的。' },
+  ]}
+  explain={<>三个需求正好对应 StatefulSet 的三个特性：<strong>独立数据盘</strong> → <code>volumeClaimTemplates</code> 给每个副本一个 PVC；<strong>固定地址</strong> → 配合 Headless Service 得到 <code>mysql-0.mysql</code> 这样稳定的 DNS 名；<strong>有序</strong> → 主库先起来，从库再启动。注意 <code>serviceName</code> 必须指向一个 Headless Service（<code>clusterIP: None</code>），否则拿不到 per-Pod 的 DNS 名。</>}
+/>
+
+<Quiz
+  id="obj-2"
+  question="改了 ConfigMap 之后，Pod 里的配置文件没有变化。以下哪些是可能的原因？"
+  options={[
+    { text: '配置是用 subPath 挂进去的', correct: true },
+    { text: '配置是通过 env / envFrom 注入的', correct: true },
+    { text: '应用本身没有重读配置文件的逻辑', correct: true },
+    { text: 'ConfigMap 必须删掉重建才能生效', feedback: 'ConfigMap 支持原地更新，不需要删除重建。' },
+  ]}
+  explain={<>三个正确选项对应三种不同的失效层次：<code>subPath</code> 和 <code>env</code> 是 <strong>kubelet 层</strong>就不会更新（前者挂的是快照，后者在进程启动时固化）；而即使文件真的变了，应用不重读也没用 —— 这是 <strong>应用层</strong>的问题。所以生产上更可靠的做法是用配置 hash 的 annotation 主动触发滚动更新，把「热更新是否生效」变成不需要赌的事。</>}
+/>
+
+## 这一节的落点
+
+- 选型三问：**跑完退出吗 → 每节点一个吗 → 需要稳定身份吗**
+- 滚动更新想真的无损，`maxUnavailable: 0` 只是第一步，还要 readinessProbe + preStop + PDB
+- StatefulSet 缩容**不删 PVC**，扩容回去会接上老数据
+- Job / CronJob 必须配 `ttlSecondsAfterFinished`，否则慢慢填满 etcd
+- ConfigMap 热更新对 `subPath` 和 `env` 无效；要确定性就用配置 hash 触发滚动更新

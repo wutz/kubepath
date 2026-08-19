@@ -1,0 +1,187 @@
+集群装完第一周风平浪静，第三周开始出各种说不清的问题：某个节点偶发 NotReady、容器日志采集器时不时崩、Pod 密度上去之后网络开始丢包。
+
+这类问题的共同点是**不可复现、看起来随机**。而它们的根子往往在装机时没对齐的几个 OS 参数上。这一节是一份上线前的检查清单。
+
+## 为什么必须装机时做
+
+节点的 OS 基线有个特点：**改起来大多要重启，或者至少要重启 kubelet 和 containerd**。集群空着的时候做，成本是零；有业务在跑之后做，就得排维护窗口、逐台 drain。
+
+所以这件事的正确时机只有一个 —— 在 `cluster.yml` 跑起来之前。
+
+## 内核版本与必需模块
+
+```bash
+uname -r                          # 内核版本
+# 生产建议 5.4+；用 Cilium 的 eBPF 特性建议 5.10+
+
+# 三个必需模块
+modprobe overlay                  # OverlayFS，容器镜像分层
+modprobe br_netfilter             # 让 iptables 能看到桥接流量，Service 转发依赖它
+modprobe nf_conntrack             # 连接跟踪
+
+# 写成开机自动加载
+cat > /etc/modules-load.d/k8s.conf <<'EOF'
+overlay
+br_netfilter
+nf_conntrack
+EOF
+```
+
+<Callout type="trap" title="br_netfilter 没加载，Service 会以一种很怪的方式坏掉">
+现象是：Pod 访问 ClusterIP 有时候通、有时候不通 —— 具体取决于目标 Pod 是不是恰好在同一节点上。
+
+原因是 `br_netfilter` 决定了桥接流量要不要过 iptables。没有它，同节点内走网桥的流量绕过了 kube-proxy 的 DNAT 规则，于是 ClusterIP 解析不出后端。跨节点的流量走路由不走桥，反而是通的。
+
+这种「一半通一半不通」的现象非常容易被误判成 CNI 或 DNS 的问题。
+</Callout>
+
+## sysctl 清单
+
+```bash
+cat > /etc/sysctl.d/99-kubernetes.conf <<'EOF'
+# 转发：Pod 网络的基础
+net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+
+# conntrack：按 Pod 密度调，每个连接占一条
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+
+# 端口与队列
+net.ipv4.ip_local_port_range = 1024 65535
+net.core.somaxconn = 32768
+net.ipv4.tcp_max_syn_backlog = 8192
+
+# 文件句柄
+fs.file-max = 2097152
+fs.nr_open = 1048576
+EOF
+
+sysctl --system
+```
+
+### inotify：容器日志采集必踩
+
+这一项单独说，因为它是高密度节点上最常见的坑：
+
+```bash
+cat > /etc/sysctl.d/80-inotify.conf <<'EOF'
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 524288
+EOF
+
+sysctl --system | grep 80-inotify.conf -A 2
+```
+
+内核默认 `max_user_instances` 只有 128。而 kubelet、日志采集器（Fluent Bit / Vector）、各种 Operator 都要 watch 文件。节点上 Pod 一多就耗尽，表现是：
+
+- 日志采集器起不来或采不到新 Pod 的日志
+- kubelet 日志里刷 `too many open files`
+- ConfigMap 更新后容器里的文件不跟着变
+
+<Callout type="warn" title="conntrack 表打满的表现">
+`nf_conntrack_max` 默认值按内存算，通常是几十万。一个节点跑 110 个 Pod、每个 Pod 几百条连接，很容易接近。
+
+打满之后内核日志会刷 `nf_conntrack: table full, dropping packet`，业务侧看到的是**随机的连接失败和超时** —— 而且监控上 CPU、内存、带宽全都正常。
+
+```bash
+# 当前用量与上限
+cat /proc/sys/net/netfilter/nf_conntrack_count
+cat /proc/sys/net/netfilter/nf_conntrack_max
+```
+把这两个数的比值做成监控指标，比事后翻 dmesg 划算得多。
+</Callout>
+
+## swap、大页与 CPU 模式
+
+```bash
+# swap：K8s 1.22 之前必须关；之后有 NodeSwap 特性但生产仍建议关
+swapoff -a
+sed -i '/swap/s/^/#/' /etc/fstab
+
+# 透明大页：数据库类负载建议关，通用负载可留
+cat /sys/kernel/mm/transparent_hugepage/enabled
+
+# CPU 频率：性能模式，避免节能策略带来的延迟抖动
+apt install -y cpufrequtils tuned
+systemctl enable tuned --now
+tuned-adm profile latency-performance
+```
+
+<Callout type="note" title="为什么关 swap">
+K8s 的资源模型建立在「内存是不可压缩资源」这个假设上：超了就 OOMKill。开了 swap 之后，超限的容器不会被杀，而是开始换页 —— 进程活着但慢得像死了，而 kubelet 的驱逐逻辑也失去了准确的判断依据。
+
+结果是最坏的情况：既没有快速失败，也没有正常服务。所以生产环境统一关掉。
+</Callout>
+
+## 时间同步：证书和 etcd 都靠它
+
+```bash
+timedatectl set-timezone Asia/Shanghai
+systemctl enable systemd-timesyncd --now
+timedatectl timesync-status
+```
+
+时间偏差的后果比想象的严重：
+
+- **证书验证失败** —— 节点时间比签发时间早，证书会被判定为「尚未生效」
+- **etcd 选主异常** —— Raft 的心跳与选举超时依赖时间
+- **日志时间线错乱** —— 排障时最要命，故障因果关系直接读不出来
+
+## 其它几项
+
+```bash
+# 防火墙：集群内部端口很多，通常在节点侧关掉，靠 NetworkPolicy 和外层防火墙管控
+ufw disable
+
+# 禁止内核自动升级 —— 自动升级过的内核可能与已编译的驱动（尤其 NVIDIA）不匹配
+# GPU 节点上这一项几乎是必须的
+
+# GPU 节点：开 persistence mode，避免驱动反复初始化带来的首次调用延迟
+systemctl enable --now nvidia-persistenced
+```
+
+<Callout type="tip" title="用 kube-node-tuning 把这些管起来">
+手工 sysctl 有两个问题：新加的节点会漏、改过的参数没人记得。
+
+[kube-node-tuning](https://github.com/kubean-io/kube-node-tuning) 把内核调优做成了集群里的一个 DaemonSet，参数写在 chart 的 values 里，新节点加进来自动生效：
+
+```bash
+helmwave up --build
+
+# 验证：节点上应该出现这个文件
+cat /etc/sysctl.d/99-kube-node-tuning.conf
+sysctl -a | grep inotify
+```
+好处是参数变成了**声明式的、进版本库的**东西 —— 这和 K8s 管其它一切的方式一致。
+</Callout>
+
+<Quiz
+  id="os-1"
+  question="节点上跑了 100 多个 Pod，日志采集器采不到新 Pod 的日志，kubelet 日志里刷 too many open files。最可能是哪个参数没调？"
+  options={[
+    { text: 'fs.inotify.max_user_instances，默认只有 128', correct: true },
+    { text: 'nf_conntrack_max 打满了', feedback: 'conntrack 打满的表现是网络包被丢、连接随机失败，不是文件句柄相关的报错。' },
+    { text: 'kubelet 的 maxPods 设太小', feedback: 'maxPods 太小的表现是 Pod 调度不上去（Pending），不是已运行 Pod 的日志采集失败。' },
+    { text: 'swap 没关', feedback: 'swap 影响的是内存超限时的行为，与 inotify 句柄无关。' },
+  ]}
+  explain={<>报错里的 <code>too many open files</code> 有两个可能来源：<code>fs.file-max</code> / <code>nr_open</code>，以及 <code>fs.inotify.max_user_instances</code>。而「采不到<strong>新</strong> Pod 的日志」这个细节指向后者 —— 采集器需要为每个新日志文件申请一个 inotify watch，默认 128 个 instances 在高密度节点上根本不够。这也是 <code>80-inotify.conf</code> 值得单独拎出来配的原因。</>}
+/>
+
+## 上线前检查清单
+
+装机之后、跑 kubespray 之前，逐项确认：
+
+| # | 检查项 | 命令 |
+| --- | --- | --- |
+| 1 | 内核版本 5.4+（用 eBPF 则 5.10+） | `uname -r` |
+| 2 | overlay / br_netfilter / nf_conntrack 已加载且开机自动加载 | `lsmod \| grep -E 'overlay\|br_netfilter'` |
+| 3 | ip_forward 与 bridge-nf-call-iptables 为 1 | `sysctl net.ipv4.ip_forward` |
+| 4 | inotify instances ≥ 8192 | `sysctl fs.inotify.max_user_instances` |
+| 5 | conntrack_max 与目标 Pod 密度匹配 | `sysctl net.netfilter.nf_conntrack_max` |
+| 6 | swap 已关且 fstab 里注释掉 | `free -h \| grep -i swap` |
+| 7 | 时间同步正常，时区一致 | `timedatectl timesync-status` |
+| 8 | cgroup v2 已启用 | `stat -fc %T /sys/fs/cgroup` → `cgroup2fs` |
+| 9 | 内核自动升级已禁用（GPU 节点必查） | 看 apt / dnf 的自动升级配置 |
+| 10 | etcd 数据盘已通过 fio 验收 | 见上一节 |

@@ -1,0 +1,277 @@
+集群里其它东西都能重建：控制面组件重启一个、节点坏了重装再 join、业务清单在 Git 里。
+
+只有 etcd 里的数据没有第二份。所以这一节练的是「**真的能恢复**」，不是「有备份」。
+
+## 先把 etcdctl 配顺
+
+kubespray 用 host 方式部署 etcd，环境变量都在一个文件里：
+
+```bash
+set -a && source /etc/etcd.env && set +a
+
+etcdctl endpoint status --write-out=table --cluster
+etcdctl endpoint health --cluster
+etcdctl member list -w table
+etcdctl alarm list
+```
+
+`set -a` 让 source 进来的变量自动导出，省得手工拼一长串 `--cert --key --cacert`。这一行值得记住。
+
+如果是静态 Pod 方式（`etcd_deployment_type: kubeadm`）：
+
+```bash
+kubectl -n kube-system exec -it etcd-mn-192-168-3-21 -- sh -c '
+ETCDCTL_API=3 etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  member list -w table'
+```
+
+## 读懂 endpoint status
+
+```
++----------------------------+------------------+---------+---------+-----------+------------+
+|          ENDPOINT          |        ID        | VERSION | DB SIZE | IS LEADER | RAFT TERM  |
++----------------------------+------------------+---------+---------+-----------+------------+
+| https://192.168.3.21:2379  | 8e9e05c52164694d |  3.5.16 |  1.2 GB |      true |         12 |
+| https://192.168.3.22:2379  | 91bc3c398fb3c146 |  3.5.16 |  1.2 GB |     false |         12 |
+| https://192.168.3.23:2379  | fd422379fda50e48 |  3.5.16 |  1.2 GB |     false |         12 |
++----------------------------+------------------+---------+---------+-----------+------------+
+```
+
+四个要看的地方：
+
+| 列 | 正常 | 异常意味着 |
+| --- | --- | --- |
+| `IS LEADER` | **有且仅有一个 true** | 0 个 = 选主中或 quorum 丢失；多个 = 脑裂 |
+| `RAFT TERM` | 所有成员一致 | 不一致 = 有成员落后；数值持续增长 = 反复选主 |
+| `DB SIZE` | 各成员接近，且远低于配额 | 接近配额 = 即将触发 NOSPACE |
+| `VERSION` | 一致 | 不一致 = 升级没做完 |
+
+<Callout type="tip" title="RAFT TERM 持续增长是磁盘问题的信号">
+`etcd_server_leader_changes_seen_total` 这个指标（以及 RAFT TERM 的数值）在涨，说明集群在反复选主。
+
+原因几乎总是这两个：**磁盘 fsync 太慢**（心跳超时）或**网络抖动**。而 L0 讲过，磁盘是更常见的那个。
+
+所以看到 term 在涨，第一件事是查 `etcd_disk_wal_fsync_duration_seconds` 的 p99，而不是去调 Raft 的超时参数 —— 调参数只是把症状盖住。
+</Callout>
+
+## 备份
+
+```bash
+set -a && source /etc/etcd.env && set +a
+
+# 打快照
+etcdctl snapshot save /backup/etcd-$(date +%F-%H%M).db
+
+# 必须验证 —— 一个损坏的快照文件在恢复时才发现就太晚了
+etcdctl snapshot status /backup/etcd-$(date +%F-%H%M).db -w table
+# +----------+----------+------------+------------+
+# |   HASH   | REVISION | TOTAL KEYS | TOTAL SIZE |
+# +----------+----------+------------+------------+
+# | 8f3a1c2d |  4829173 |      12847 |     1.2 GB |
+# +----------+----------+------------+------------+
+```
+
+一份能用的备份策略：
+
+| 项 | 建议 |
+| --- | --- |
+| 频率 | 每小时一次，保留 24 份；每天一份保留 30 天 |
+| 位置 | **异地** —— 存在控制面节点本地的备份，机房级故障时一起没了 |
+| 变更前 | 每次控制面变更、升级前**额外打一次**并验证 |
+| 加密 | etcd 里有全部 Secret 的明文，快照必须加密存储 |
+| **恢复演练** | **每季度一次，在隔离环境真的恢复出一个集群** |
+
+<Callout type="trap" title="没演练过的备份等于没有备份">
+这不是一句口号。恢复流程里有很多只有真做过才知道的细节：
+
+- 快照文件在哪台机器上、谁有权限取
+- 恢复时 `--initial-cluster` 该怎么填、`--name` 要和什么对应
+- 恢复之后证书是否还匹配、静态 Pod 清单要不要改
+- 业务侧还需要做什么（PV 与后端存储的对应关系还在吗）
+
+真出事时是高压环境，没有时间现学。演练的产出应该是一份**逐条可执行的恢复手册**，而不只是「我们试过，能恢复」。
+</Callout>
+
+## 恢复
+
+**恢复是把所有成员一起重建，不是逐个恢复。** 顺序错了会得到一个数据不一致的集群。
+
+```bash
+# 【所有控制面节点】1. 停 etcd 与 apiserver
+systemctl stop etcd
+systemctl stop kubelet          # 顺带停掉静态 Pod 方式的 apiserver
+
+# 【所有控制面节点】2. 移走旧数据（别直接删，留着备查）
+mv /var/lib/etcd /var/lib/etcd.bak-$(date +%F)
+
+# 【每个节点分别执行】3. 从同一份快照恢复，注意每台的 --name 和 IP 不同
+etcdutl snapshot restore /backup/etcd-2026-08-19-1400.db \
+  --name etcd1 \
+  --initial-cluster etcd1=https://192.168.3.21:2380,etcd2=https://192.168.3.22:2380,etcd3=https://192.168.3.23:2380 \
+  --initial-advertise-peer-urls https://192.168.3.21:2380 \
+  --initial-cluster-token etcd-cluster-restored \
+  --data-dir /var/lib/etcd
+
+# 【所有节点】4. 启动
+systemctl start etcd
+etcdctl endpoint status --write-out=table --cluster
+
+# 5. etcd 健康后再起 kubelet
+systemctl start kubelet
+kubectl get node
+```
+
+三个容易错的点：
+
+1. **`--name` 与 `--initial-advertise-peer-urls` 每台不同**，要和 inventory 里的 `etcd_member_name` 对应
+2. **`--initial-cluster` 三台完全一致**，且必须是恢复后的目标拓扑
+3. **`--initial-cluster-token` 换一个新值** —— 避免和历史集群混淆
+
+> 新版本用 `etcdutl`（离线操作工具），旧版本用 `etcdctl snapshot restore`。
+
+<Callout type="warn" title="恢复必然丢数据，恢复后必须核对业务状态">
+快照之后的所有变更都没了。这意味着恢复之后集群可能处于一个奇怪的状态：
+
+- 快照后创建的 Pod、PVC、Secret 都不见了，但**后端存储上的卷还在**（成了孤儿）
+- 快照后删除的对象又回来了，控制器会重新按它们创建资源
+- 节点可能因为 token 或证书变化需要重新 join
+
+所以恢复流程的最后一步不是 `kubectl get node` 全 Ready，而是**逐个核对关键业务的状态**，特别是有状态服务的 PV 与后端卷的对应关系。
+</Callout>
+
+## 空间告警：mvcc: database space exceeded
+
+这是 etcd 最常见的生产故障，而且现象非常吓人 —— 看起来整个集群挂了。
+
+```
+etcdserver: mvcc: database space exceeded
+```
+
+### 为什么会发生
+
+etcd 用 MVCC：每次对象的创建、更新、删除都产生一个新 revision，**历史版本会不断累积**。默认配额只有 2GB（见《把规划写进配置》），对象多、变更频繁的集群几个月就会撞上。
+
+一旦触发 NOSPACE alarm，etcd 进入维护模式：**只允许读和删除，拒绝所有写入**。表现是 apiserver 全面报错、Pod 调度不了、`kubectl apply` 全失败。
+
+### 救火：所有 etcd 节点都要执行
+
+```bash
+set -a && source /etc/etcd.env && set +a
+
+# 1. 确认现状
+etcdctl endpoint status --write-out=table --cluster
+etcdctl alarm list
+
+# 2. 压缩历史版本
+revision=$(etcdctl endpoint status --write-out=json | jq '.[0].Status.header.revision')
+etcdctl compact $revision
+
+# 3. 碎片整理 —— 真正把空间还给文件系统
+etcdctl defrag
+
+# 4. 解除 alarm
+etcdctl alarm disarm
+
+# 5. 确认 DB SIZE 降下来了
+etcdctl endpoint status --write-out=table --cluster
+```
+
+<Callout type="warn" title="compact 与 defrag 是两件不同的事，都要做">
+- **`compact`** 丢弃指定 revision 之前的历史版本 —— 逻辑上腾出了空间，但**文件不会变小**
+- **`defrag`** 整理 boltdb 文件，把 compact 释放的空间真正还给文件系统 —— DB SIZE 才会下降
+
+只 compact 不 defrag，`DB SIZE` 一点不变，看起来像没生效。
+
+`defrag` 期间该成员**会短暂阻塞**（大库可能几秒到几十秒）。所以要**一台一台做，中间等它恢复健康**，绝不能三台同时 defrag —— 那会让 quorum 一起消失。
+</Callout>
+
+### 长期解决
+
+```bash
+# 1. 提高配额到 8GB（官方建议上限）
+vim /etc/etcd.env
+ETCD_QUOTA_BACKEND_BYTES=8589934592
+systemctl restart etcd            # 一台一台重启
+
+# 或者在 kubespray 里配好，避免每次手工改
+# group_vars/all/etcd.yml
+#   etcd_quota_backend_bytes: 8589934592
+
+# 2. 确认自动压缩已开启
+grep -i compaction /etc/etcd.env
+# ETCD_AUTO_COMPACTION_MODE=periodic
+# ETCD_AUTO_COMPACTION_RETENTION=8h
+
+# 3. 验证配额真的生效了
+curl --cert $ETCDCTL_CERT --key $ETCDCTL_KEY --cacert $ETCDCTL_CACERT \
+  $ETCDCTL_ENDPOINTS/metrics | grep quota
+# etcd_server_quota_backend_bytes 8.589934592e+09
+```
+
+### 治本：找出谁在制造 revision
+
+提高配额只是把撞墙时间推后。真正的问题往往是某类对象在疯狂变化：
+
+```bash
+# 看各类对象的数量，找出异常多的那类
+etcdctl get / --prefix --keys-only | \
+  sed 's|/registry/\([^/]*\)/.*|\1|' | sort | uniq -c | sort -rn | head -20
+```
+
+常见的元凶：
+
+| 来源 | 原因 | 处理 |
+| --- | --- | --- |
+| Event | 默认保留 1 小时，但量极大 | 缩短 `--event-ttl`，或存到独立 etcd |
+| Job / Pod | CronJob 没配 `ttlSecondsAfterFinished` | 配上 TTL 和 history limit |
+| Lease | 组件在高频续租 | 查是哪个组件，通常是配置问题 |
+| 自定义资源 | 某个 Operator 在反复更新 status | 查那个控制器的 reconcile 逻辑 |
+
+<Callout type="tip" title="CronJob 是最常见的那个">
+每天几百个 CronJob 实例，不配 `ttlSecondsAfterFinished`，跑一年就是十几万个 Job 和 Pod 对象堆在 etcd 里。
+
+```yaml
+spec:
+  ttlSecondsAfterFinished: 3600      # Job 完成 1 小时后自动删
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+```
+这三行配置能避免一大类 etcd 膨胀问题。值得作为集群的准入策略强制要求。
+</Callout>
+
+<Quiz
+  id="etcd-ops-1"
+  question="etcd 报 database space exceeded，你执行了 compact，但 DB SIZE 一点没变。为什么？"
+  options={[
+    { text: 'compact 只丢弃历史版本，还需要 defrag 才能把空间还给文件系统', correct: true },
+    { text: 'compact 的 revision 参数填错了', feedback: '填错会直接报错，不会静默无效。' },
+    { text: '需要重启 etcd 才生效', feedback: '重启不会整理 boltdb 文件的碎片，DB SIZE 依然不变。' },
+    { text: 'alarm 还没解除，所以看不到变化', feedback: 'alarm 影响的是能否写入，与 DB SIZE 的显示无关。' },
+  ]}
+  explain={<>两步是分开的：<code>compact</code> 在逻辑上释放了历史版本占的空间，但 boltdb 文件大小不变（空间变成了文件内部的碎片）；<code>defrag</code> 才真正整理文件并归还空间。完整顺序是 <strong>compact → defrag → alarm disarm</strong>。注意 defrag 会让该成员短暂阻塞，必须一台一台做。</>}
+/>
+
+<Quiz
+  id="etcd-ops-2"
+  question="关于 etcd 恢复，下面哪些说法正确？"
+  options={[
+    { text: '恢复要把所有成员一起重建，不是逐个恢复', correct: true },
+    { text: '每台的 --name 和 peer-urls 不同，但 --initial-cluster 三台一致', correct: true },
+    { text: '恢复后要核对有状态服务的 PV 与后端卷的对应关系', correct: true },
+    { text: '只要备份文件存在，恢复就没有风险', feedback: '快照之后的变更全部丢失，可能留下孤儿卷、已删对象复活、节点需要重新 join。而且没演练过的恢复流程本身就是风险。' },
+  ]}
+  explain={<>恢复的本质是「用同一份数据重建一个新的 etcd 集群」，所以必须整体进行，且要换一个新的 <code>initial-cluster-token</code> 以免和历史集群混淆。而恢复完成的判断标准不是节点 Ready，而是业务状态核对完成 —— 尤其是存储：快照后创建的 PVC 消失了，但后端的卷还在，那些卷会变成没人认领的孤儿。</>}
+/>
+
+## 这一节的落点
+
+- `set -a && source /etc/etcd.env && set +a` 是最省事的开场
+- `endpoint status` 看四处：**唯一 leader、term 一致、DB SIZE、version 一致**
+- **term 持续增长 → 先查磁盘 fsync**，不要调 Raft 超时参数
+- 备份要异地、要加密（里面有全部 Secret 明文）、**要每季度真的恢复演练一次**
+- 恢复是**整体重建**：每台 `--name` 不同、`--initial-cluster` 一致、换新 token
+- 空间告警：**compact → defrag → alarm disarm**，一台一台做
+- 治本是找出谁在制造 revision，CronJob 缺 `ttlSecondsAfterFinished` 是最常见的

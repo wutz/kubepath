@@ -1,0 +1,282 @@
+默认调度器一个一个地放 Pod。而一个 8 卡分布式训练任务，要么 8 个 Pod 全起来，要么一个都别起 —— 起 5 个是最坏的结果：**5 张卡被占着谁也用不了，任务也跑不起来**。
+
+这就是 gang scheduling 要解决的问题，也是 AI 集群必须换调度方案的原因。
+
+## 资源死锁是怎么发生的
+
+```
+集群共 8 张卡。任务 A 需要 8 卡，任务 B 需要 8 卡，同时提交。
+
+默认调度器逐个放 Pod：
+  A 的 Pod 1-4 拿到卡（占 4）
+  B 的 Pod 1-4 拿到卡（占 4）
+  A 的 Pod 5-8 Pending —— 没卡了
+  B 的 Pod 5-8 Pending —— 没卡了
+
+结果：8 张卡全被占用，两个任务都跑不起来，而且谁也不会主动让出。
+```
+
+这是**活锁**：资源都在用，但没有任何进展。而且不会自动恢复 —— 除非有人手工删掉一个任务。
+
+gang scheduling 的核心就一句话：**要么整组一起调度成功，要么一个都不调度**（all-or-nothing）。
+
+## 三个方案的定位
+
+| 方案 | 切入层面 | 结论 |
+| --- | --- | --- |
+| **Kueue** | **准入层**（admission webhook） | 🏆 **首选** |
+| **Volcano** | **调度层**（独立 scheduler） | 🥈 备选 |
+| **Coscheduling**（scheduler-plugins） | 调度器插件 | 🚫 **明确弃用** |
+| kube-scheduler 原生 gang | 调度器内置 | 🚫 v1.35 仍 Alpha，禁止用于生产 |
+
+### 为什么 Kueue 是首选
+
+它工作在**准入层**，这个位置的差别是决定性的：
+
+```
+Kueue：   资源够 → 放行（unsuspend），创建 Pod
+          资源不够 → 拦截，Job 保持 suspend，【0 个 Pod 被创建】
+
+Volcano： Pod 直接创建 → 交给 Volcano 评估
+          资源不够 → 【全组 Pod 处于 Pending】，等着凑齐
+```
+
+「0 个 Pod」和「一批 Pending Pod」的差别不只是好看 —— **Pending Pod 会持续消耗调度器和 apiserver 的资源**，而被拦在准入层的 Job 只是一个 suspend 状态的对象，零调度开销。
+
+对 Kubeflow Trainer 的接入也最简单，只要加三个字段：
+
+```yaml
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: my-job
+  labels:
+    kueue.x-k8s.io/queue-name: gpu-local-queue    # 必填：指向 LocalQueue
+spec:
+  suspend: true                                   # 必填：交给 Kueue 决定何时放行
+  runtimeRef:
+    name: torch-distributed
+  trainer:
+    numNodes: 2
+    resourcesPerNode:
+      requests:
+        nvidia.com/gpu: "1"
+```
+
+不需要手工创建任何 PodGroup，webhook 自动接管。
+
+> 避坑：不要配 `spec.managedBy`，那个字段只在 MultiKueue 跨集群场景用。
+
+<Callout type="trap" title="Kueue 与 Volcano 同时安装会让 Volcano 彻底瘫痪">
+这是一个必须知道的致命冲突。
+
+如果集群里**同时装了** Kueue 和 Volcano，Kueue 的 Pod mutating webhook 会拦截 Volcano 的 Pod，强行覆盖 `schedulerName` 并注入 `suspended=true` —— Volcano 的调度**完全失效**。
+
+规避方式：确保 Kueue 的 `values.yaml` 里 `integrations.frameworks` **绝对不包含 `pod` 和 `deployment`**，只保留明确的 Job 类资源：
+
+```yaml
+integrations:
+  frameworks:
+    - "batch/job"
+    - "trainer.kubeflow.org/trainjob"
+    # 不要有 "pod" 和 "deployment"
+```
+
+排查线索：`kubectl get pod <name> -o yaml | grep schedulerName`，如果本该是 `volcano` 却变成了默认值，就是被 Kueue 的 webhook 改了。
+</Callout>
+
+### Volcano 的使用成本
+
+Volcano 需要 `PodGroup` 对象，而 TrainJob 的 webhook **不会**自动创建 Volcano 版本的 PodGroup，得手工来：
+
+```yaml
+# 1. 必须【先】创建 PodGroup
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: PodGroup
+metadata:
+  name: my-training
+spec:
+  minMember: 2          # 必须等于 TrainJob 的 trainer.numNodes
+  queue: default
+---
+# 2. 再提交 TrainJob，并通过 runtimePatches 注入 group-name annotation
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata: { name: my-training }
+spec:
+  suspend: false
+  runtimeRef:
+    name: torch-distributed-volcano    # 这个 runtime 要配 schedulerName: volcano
+  trainer:
+    numNodes: 2
+    resourcesPerNode:
+      requests: { nvidia.com/gpu: "1" }
+  runtimePatches:
+    - manager: scheduling.volcano.sh/volcano
+      trainingRuntimeSpec:
+        template:
+          spec:
+            replicatedJobs:
+              - name: node
+                template:
+                  spec:
+                    template:
+                      metadata:
+                        annotations:
+                          scheduling.k8s.io/group-name: my-training   # 要与 PodGroup 同名
+```
+
+<Callout type="warn" title="时序陷阱：必须先创建 PodGroup 再提交 TrainJob">
+顺序反了的话，TrainJob 匹配不到 Gang，**任务永远不会被调度** —— 而且不会有明显的报错，只是一直卡着。
+
+这就是 Volcano 接入体验的主要成本：三个对象要手工对齐（PodGroup 名字、`minMember` 数值、annotation 里的 group-name），任一处不一致就静默失败。
+</Callout>
+
+### 为什么坚决弃用 Coscheduling
+
+Coscheduling 是 scheduler-plugins 的一部分，它的硬伤在于**资源不足时的调度风暴**。
+
+它本质上是个插件，底层仍然依赖 kube-scheduler 逐个 Pod 处理。提交一个需要 48 GPU 的任务而集群只有 24 GPU 时：
+
+```
+48 个 Pod 全部被创建并 Pending
+  → 调度器每个调度周期都去尝试绑定这 48 个 Pod
+    → 到 Permit 阶段发现凑不齐，全部打回
+      → 下个周期继续尝试
+        → 无限循环
+```
+
+**实测结果：很短时间内产生超过 40 万次 `FailedScheduling` 事件**，把 apiserver 和调度器的资源吃光。
+
+而这些事件还会写进 etcd（L2《etcd 运维》讲过 Event 是对象膨胀的主要来源之一），进一步放大影响。加上社区重心已经转移，长期维护存疑 —— 所以是明确弃用，不是「可选方案之一」。
+
+## Kueue vs Volcano 的关键差异
+
+| 维度 | Kueue | Volcano |
+| --- | --- | --- |
+| 切入层面 | 准入层 | 调度层 |
+| 资源不够时 | **0 个 Pod 被创建** | 全组 Pod Pending |
+| 配额发现 | **手工填 `nominalQuota`**，不自动发现集群资源 | 默认 `root` queue 自动继承集群总资源 |
+| 抢占粒度 | 同 Cohort 的 Workload 级（all-or-nothing） | 跨 Queue / 同 Queue 的 PodGroup 级 |
+| 额外组件 | **1 个**：`kueue-controller-manager` | 3 个：scheduler + controller + admission |
+| CRD 简称冲突 | LocalQueue 简称是 `queue` ⚠️ | Queue 简称是 `q` ⚠️ |
+
+<Callout type="warn" title="Kueue 的 nominalQuota 需要人工与集群容量对齐">
+这是 Kueue 最需要注意的运维负担：它**不会自动发现集群资源**，队列配额要手工写。
+
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata: { name: gpu-cluster-queue }
+spec:
+  resourceGroups:
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: h100
+          resources:
+            - name: "nvidia.com/gpu"
+              nominalQuota: 64        # 手工填，要与实际卡数对齐
+```
+
+后果是：**集群扩容加了新 GPU 节点，如果忘了改 `nominalQuota`，新增的卡不会被使用** —— 任务照旧排队，而 `kubectl get node` 显示卡是空闲的。
+
+所以扩容 GPU 节点的检查清单里必须包含「更新 Kueue 配额」，最好做成自动化。
+</Callout>
+
+## 队列与配额设计
+
+多团队共享 GPU 集群的典型结构：
+
+```
+ClusterQueue（集群级配额池）
+  ├─ Cohort：允许队列之间借用空闲配额
+  │
+  ├─ LocalQueue team-a（namespace: team-a）
+  └─ LocalQueue team-b（namespace: team-b）
+```
+
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata: { name: team-a-queue }
+spec:
+  cohort: shared-gpu              # 同 cohort 的队列可以互相借用
+  resourceGroups:
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: h100
+          resources:
+            - name: "nvidia.com/gpu"
+              nominalQuota: 32     # 保底配额
+              borrowingLimit: 32   # 最多能借多少
+  preemption:
+    reclaimWithinCohort: Any       # 借出去的配额可以要回来
+    withinClusterQueue: LowerPriority
+```
+
+**借用（borrowing）是这套设计最实用的部分**：A 团队保底 32 卡，B 团队夜里不用时 A 可以借到 64 卡；B 白天要用时能把自己的配额收回来。既保证了公平，又不让卡闲着。
+
+## 排障速查
+
+### Kueue
+
+| 症状 | 诊断 | 常见原因 |
+| --- | --- | --- |
+| TrainJob 一直 `Suspended` | `kubectl get workload`<br/>`kubectl describe workload <name>` | 忘了打 `kueue.x-k8s.io/queue-name` label；LocalQueue 名字错或不在当前命名空间；`nominalQuota` 不足（正常排队） |
+| Workload `Admitted=False` | 看 `status.conditions[].message` | 拓扑感知调度（TAS）找不到符合拓扑的节点；`nominalQuota` 小于请求量 |
+| TAS 莫名拦截任务 | `kubectl get nodes -L kubernetes.io/hostname` | 节点缺少拓扑层级要求的标签；**GPU 节点的 tolerations 没在 `ResourceFlavor` 里显式声明**（TAS 不认自动注入的） |
+
+### Volcano
+
+| 症状 | 诊断 | 常见原因 |
+| --- | --- | --- |
+| TrainJob 卡住，PodGroup 没创建 | `kubectl get podgroups.scheduling.volcano.sh` | 忘了先应用 PodGroup |
+| Pod 的 `schedulerName` 不是 volcano | `kubectl get pod -o yaml \| grep schedulerName` | **被 Kueue 的 webhook 覆盖了**（见上面的致命冲突） |
+| Pod 没关联到 PodGroup | `grep group-name` | `runtimePatches` 写错，annotation 没注入成功 |
+| PodGroup 一直 Pending | `kubectl describe podgroup` | 卡真的不够；或 `minMember` 与 `numNodes` 数值不一致 |
+
+## 演进方向
+
+SIG-scheduling 的终态是 **Kueue 管配额 + kube-scheduler 原生管 gang**，彻底不需要第三方调度器。原生支持在 v1.35 引入（Alpha，默认禁用），核心设计：
+
+1. **PreEnqueue 阻塞** —— Pod 进调度队列**之前**就确认 PodGroup 存在且成员数达标，否则拦在队外。这直接解决了 Coscheduling 的盲目重试
+2. **Workload Scheduling Cycle**（v1.36）—— 把整个 PodGroup 作为一个调度单元，单次周期内完成全组评估，从根上消除死锁和活锁
+3. **Delayed Preemption** —— 找抢占受害者时只计算不执行，只有确认抢占后能满足整组 `minCount` 才真正驱逐，实现零无效干扰
+4. **API 解耦**（v1.36 v1alpha2）—— 策略模板 `Workload` 与运行时实例 `PodGroup` 分离，减小 etcd 压力
+
+**路线图**：当前用 Kueue；等原生稳定后 Kueue + 原生 PodGroup，Kueue 放行 Pod 后由内置机制保证 all-or-nothing。
+
+<Quiz
+  id="aisched-1"
+  question="为什么 Kueue 在准入层拦截比 Volcano 在调度层等待更好？"
+  options={[
+    { text: '资源不够时 0 个 Pod 被创建，没有 Pending Pod 持续消耗调度器和 apiserver', correct: true },
+    { text: 'Kueue 的调度算法更先进', feedback: '两者不是同一层的东西 —— Kueue 不做调度，它只决定放不放行，实际调度还是 kube-scheduler 做。' },
+    { text: 'Kueue 支持的 GPU 型号更多', feedback: '与 GPU 型号无关，两者都通过扩展资源识别 GPU。' },
+    { text: 'Volcano 不支持 gang scheduling', feedback: 'Volcano 是老牌的 gang scheduling 实现，支持得很好 —— 只是接入成本高、组件多。' },
+  ]}
+  explain={<>差别在于「资源不够」时集群里留下了什么：Kueue 留下一个 suspend 状态的 Job 对象（零调度开销）；Volcano 留下一批 Pending Pod（调度器每个周期都要处理）。这个差别在大规模、高提交频率的集群上非常明显 —— 也正是 Coscheduling 被淘汰的同一个原因，只是 Coscheduling 更极端（实测 40 万次 FailedScheduling 事件）。</>}
+/>
+
+<Quiz
+  id="aisched-2"
+  question="集群扩容加了 4 台八卡机（共 32 卡），但 Kueue 队列里的任务还在排队，kubectl get node 显示新卡空闲。为什么？"
+  options={[
+    { text: 'Kueue 不自动发现集群资源，ClusterQueue 的 nominalQuota 需要手工更新', correct: true },
+    { text: '新节点缺少 GPU 标签', feedback: '值得检查，但那会导致 Pod 调度不上去（Insufficient nvidia.com/gpu），而不是任务停在 Kueue 的排队阶段。' },
+    { text: 'device-plugin 没起来', feedback: '同上 —— 那样 kubectl get node 也不会显示有可用的 nvidia.com/gpu 资源。题干说卡是空闲可见的。' },
+    { text: 'Kueue 需要重启才能感知新节点', feedback: '重启不会改变 nominalQuota 的值，它是配置里写死的数字。' },
+  ]}
+  explain={<>这是 Kueue 与 Volcano 一个很实际的差异：Volcano 的 root queue 默认继承集群总资源，而 <strong>Kueue 的 <code>nominalQuota</code> 是手工填的数字</strong>，不会随集群容量变化。所以「扩容 GPU 节点」这个操作的检查清单里必须包含「同步更新 Kueue 配额」，否则新买的卡就白闲着 —— 而且现象很迷惑，因为节点和卡看起来都正常。</>}
+/>
+
+## 这一节的落点
+
+- gang scheduling 解决的是**活锁**：资源都被占着但没有任何任务能推进
+- **首选 Kueue**（准入层，0 Pod 开销，Trainer 原生支持三个字段）；备选 Volcano（调度层，插件生态丰富）
+- **Coscheduling 明确弃用** —— 实测 40 万次 FailedScheduling 事件
+- **Kueue 与 Volcano 同装会让 Volcano 瘫痪**：`integrations.frameworks` 里绝不能有 `pod` 和 `deployment`
+- Volcano 必须**先建 PodGroup 再提交任务**，且三处名字与数值要对齐
+- **Kueue 的 `nominalQuota` 手工维护** —— 扩容 GPU 后必须同步，否则新卡不会被使用
+- Cohort 的借用机制让「保底 + 弹性」可以共存
+- 演进终态：Kueue 管配额 + kube-scheduler 原生管 gang

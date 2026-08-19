@@ -1,0 +1,254 @@
+调度这件事，一句话就能说清：**requests 决定能不能放进去，limits 决定放进去之后能用多少。**
+
+这两个字段配错，集群会以两种相反的方式出问题 —— 要么资源明明有却调不满，要么调满了一压就崩。
+
+## 两阶段：过滤与打分
+
+```
+所有节点
+  │
+  ├─ 过滤（Filter / Predicates）—— 硬条件，不满足就出局
+  │    · 可分配资源够不够（按 requests 算）
+  │    · 污点能不能容忍
+  │    · nodeSelector / nodeAffinity 匹不匹配
+  │    · 端口冲突、卷的拓扑约束
+  │    ▼
+  │  可行节点
+  │
+  ├─ 打分（Score / Priorities）—— 软偏好，选最高分
+  │    · 资源均衡（倾向剩余资源多的）
+  │    · 亲和性偏好（preferred）
+  │    · 镜像本地性（节点上已有镜像的加分）
+  │    ▼
+  └─ 绑定（Bind）—— 把 spec.nodeName 写回去，调度器的活就干完了
+```
+
+**过滤没有节点通过 → Pod Pending，Events 里会写清每个节点被淘汰的原因。** 这是排查 Pending 的唯一入口：
+
+```bash
+kubectl describe pod web-0 | sed -n '/Events/,$p'
+
+# 典型输出，直接告诉你为什么
+# 0/12 nodes are available:
+#   3 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: },
+#   7 Insufficient cpu,
+#   2 node(s) didn't match Pod's node affinity/selector.
+```
+
+<Callout type="tip" title="这段输出要逐条读">
+`0/12 nodes are available` 后面的分类计数是调度器给你的完整解释，加起来一定等于总节点数。
+
+读法是找**最大的那一类**：上面这个例子里 7 个节点是 `Insufficient cpu`，说明主要矛盾是 CPU requests 要得太多，而不是亲和性配错。改亲和性是白费功夫。
+</Callout>
+
+## requests / limits 与 QoS
+
+```yaml
+resources:
+  requests:            # 调度依据：调度器只看这个
+    cpu: 500m
+    memory: 1Gi
+  limits:              # 运行时上限：cgroup 里的硬约束
+    cpu: 2
+    memory: 2Gi
+```
+
+两者的关系决定了 Pod 的 **QoS 等级**，而 QoS 决定了节点内存不足时**谁先被杀**：
+
+| QoS | 条件 | 驱逐顺序 |
+| --- | --- | --- |
+| **Guaranteed** | 所有容器 requests == limits（CPU 和内存都要） | 最后 |
+| **Burstable** | 设了 requests，但不等于 limits | 中间 |
+| **BestEffort** | 什么都没设 | **最先** |
+
+```bash
+kubectl get pod web-0 -o jsonpath='{.status.qosClass}'
+```
+
+<Callout type="trap" title="不设 requests 是在赌运气">
+不设 requests 的 Pod 是 BestEffort，会产生两个后果：
+
+1. **调度器认为它不占资源**，于是可以往一个节点上塞任意多个 —— 直到节点真的被压爆
+2. **节点内存不足时它第一个被杀**，而且是在你毫无准备的时候
+
+更隐蔽的问题是它把整个集群的容量规划变成了假的：`kubectl top node` 显示 60% 使用率，`describe node` 显示 requests 只分配了 30%，而节点随时可能 OOM。
+
+**所有生产 Pod 都必须设 requests。** 用 LimitRange 给命名空间配默认值，能兜住漏配的情况。
+</Callout>
+
+### CPU 与内存的性质不同
+
+这是 L0 讲过的结论，在这里有直接的配置含义：
+
+| | 超过 limits 的后果 | 建议 |
+| --- | --- | --- |
+| CPU | 被限流（throttle），变慢不死 | limits 可以适度大于 requests |
+| 内存 | 直接 OOMKilled | **limits 建议等于 requests** |
+
+```bash
+# 判断是否被 CPU 限流 —— 这两个数在涨就是
+cat /sys/fs/cgroup/.../cpu.stat | grep -E 'nr_throttled|throttled_usec'
+```
+
+<Callout type="warn" title="CPU limits 设太小的代价，在 Java 和 Go 上尤其明显">
+CPU 限流是按 100ms 周期硬切的。JVM 的 GC、Go 的 GC、以及任何服务的启动期都会有短时间的 CPU 尖峰。
+
+如果 `limits.cpu` 卡得很死，进程会在每个周期被反复掐断 —— 表现是 **P99 延迟毛刺、健康检查偶发超时，而 CPU 平均使用率看起来一点都不高**。
+
+这也是很多团队最终选择「内存 limits 严格、CPU limits 放宽或不设」的原因。不设 CPU limits 的风险是单个 Pod 可能抢占整机 CPU，需要靠 requests 的权重和监控来平衡。
+</Callout>
+
+## 亲和性与污点：两个方向的控制
+
+一个是 Pod 挑节点，一个是节点挑 Pod：
+
+```yaml
+# 方向一：Pod 说我要去哪（亲和性）
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:   # 硬要求
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: nvidia.com/gpu.product
+              operator: In
+              values: [NVIDIA-H100-80GB-HBM3]
+    preferredDuringSchedulingIgnoredDuringExecution:  # 软偏好
+      - weight: 100
+        preference:
+          matchExpressions:
+            - key: topology.kubernetes.io/zone
+              operator: In
+              values: [rack-a]
+```
+
+```yaml
+# 方向二：节点说我只接受谁（污点 + 容忍）
+# 节点侧
+kubectl taint node gn-10-128-1-1 dedicated=training:NoSchedule
+
+# Pod 侧
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: training
+    effect: NoSchedule
+```
+
+| 污点 effect | 作用 |
+| --- | --- |
+| `NoSchedule` | 新 Pod 不调度上来，已有的不动 |
+| `PreferNoSchedule` | 尽量不调度，实在没地方也可以 |
+| `NoExecute` | 新的不来，**已有的驱逐走** |
+
+<Callout type="note" title="容忍不等于吸引">
+一个常见误解：给 Pod 加了 GPU 节点的容忍，它就会去 GPU 节点。
+
+**不会。** 容忍只是「我不排斥那里」，Pod 照样可能被放到普通节点上。要真的定向，需要容忍（能进去）+ 亲和性或 nodeSelector（想进去）两件一起配。
+
+这也是 GPU 节点被普通业务占用的典型原因：某个基础组件的 DaemonSet 写了 `tolerations: [{operator: Exists}]`，于是它到处都能去。
+</Callout>
+
+## topologySpreadConstraints：把副本摊开
+
+三副本被放到同一个机架，机架掉电就全没了。这个约束用来避免它：
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1                                    # 任意两个域之间副本数最多差 1
+    topologyKey: topology.kubernetes.io/zone      # 按机架/可用区分布
+    whenUnsatisfiable: DoNotSchedule              # 满足不了就别调度（硬约束）
+    labelSelector:
+      matchLabels: { app: web }
+```
+
+| `whenUnsatisfiable` | 行为 |
+| --- | --- |
+| `DoNotSchedule` | 摊不开就 Pending —— 真高可用，但可能调度失败 |
+| `ScheduleAnyway` | 尽量摊开，摊不开也放 —— 不保证，但不会卡住 |
+
+前提是节点上有 `topology.kubernetes.io/zone` 标签（L0 的《硬件与拓扑》讲了为什么装机时就要打）。**没打标签的话这个约束等于没配。**
+
+## 优先级、抢占与 PDB
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: { name: high-priority }
+value: 1000000
+preemptionPolicy: PreemptLowerPriority   # 资源不够时可以踢掉低优先级 Pod
+globalDefault: false
+```
+
+```yaml
+# PDB：限制「自愿中断」能同时带走多少副本
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+spec:
+  minAvailable: 2          # 或 maxUnavailable: 1
+  selector:
+    matchLabels: { app: web }
+```
+
+<Callout type="warn" title="PDB 管得住 drain，管不住抢占和节点宕机">
+PDB 保护的是**自愿中断**：`kubectl drain`、集群升级、autoscaler 缩容。这些操作会尊重 PDB，超了就阻塞等待。
+
+它管不住的是：
+- **节点直接宕机** —— 这是非自愿中断，物理事实，PDB 无从干预
+- **优先级抢占** —— 高优先级 Pod 抢占时会尽量尊重 PDB，但资源实在不够时仍会突破
+
+所以 PDB 是维护流程的护栏，不是高可用的实现手段。真正的高可用靠副本数 + 拓扑分布。
+
+反过来，PDB 配错也会**卡住维护**：`minAvailable` 等于副本数时，drain 会永远等待，因为驱逐任何一个都会违反约束。
+</Callout>
+
+## GPU 与扩展资源
+
+GPU 不是 CPU 那样的可分割资源：
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: 2      # 扩展资源只能写 limits，且必须是整数
+```
+
+三条规则：
+
+1. **不可超卖** —— 一张卡同时只能给一个容器（除非用 MIG 或 time-slicing）
+2. **requests 会被自动设成等于 limits** —— 所以 GPU Pod 天然是 Guaranteed
+3. **必须显式申请** —— 依赖 `NVIDIA_VISIBLE_DEVICES=all` 绕过资源系统会踩 L0 讲过的 `daemon-reload` 坑
+
+而默认调度器对 GPU 有个根本性的不足：**它一个一个地放 Pod**。8 卡分布式训练需要 8 个 Pod 全都拿到卡才有意义，默认调度器可能放上 5 个然后卡住 —— 5 张卡被占着谁也用不了。这就是 L4 要讲 gang scheduling 的原因。
+
+<Quiz
+  id="sched-1"
+  question="describe pod 显示：0/12 nodes are available: 3 node(s) had untolerated taint, 7 Insufficient cpu, 2 node(s) didn't match node affinity。最该先改什么？"
+  options={[
+    { text: '降低 Pod 的 CPU requests，或者给集群加节点', correct: true },
+    { text: '给 Pod 加上对控制面污点的容忍', feedback: '只解决 3 个节点，而且往控制面节点调度业务 Pod 是个坏主意 —— 那个污点存在是有原因的。' },
+    { text: '放宽 nodeAffinity', feedback: '只涉及 2 个节点，不是主要矛盾。' },
+    { text: '提高 Pod 的优先级去抢占', feedback: '抢占能解一时之急，但根因是 requests 与集群容量不匹配；抢占只是把问题转移到被踢掉的那些 Pod 上。' },
+  ]}
+  explain={<>这段输出的分类计数加起来等于总节点数（3+7+2=12），要找的是<strong>最大的那一类</strong>：7 个节点 <code>Insufficient cpu</code> 才是主要矛盾。先核对 requests 是不是照着峰值填的 —— requests 只需要覆盖常态用量，峰值交给 limits。这是最常见的一类浪费：requests 填成峰值，集群资源利用率长期只有 30% 却调不进新 Pod。</>}
+/>
+
+<Quiz
+  id="sched-2"
+  question="关于 requests、limits 与 QoS，下面哪些说法正确？"
+  options={[
+    { text: '调度器只看 requests，不看 limits', correct: true },
+    { text: '内存 limits 建议等于 requests，因为内存超限是直接被杀', correct: true },
+    { text: 'BestEffort 的 Pod 在节点内存不足时最先被驱逐', correct: true },
+    { text: 'CPU limits 设得越小越安全', feedback: '恰恰相反。CPU 限流按 100ms 硬切，limits 太小会导致 P99 延迟毛刺和健康检查偶发超时，而平均 CPU 使用率看起来很低。' },
+  ]}
+  explain={<>核心是 CPU 与内存的性质差异：CPU 可压缩（超限变慢），内存不可压缩（超限被杀）。所以内存要 requests == limits 求确定性，CPU 则可以让 limits 大于 requests 以吸收尖峰。而调度只看 requests 这一点意味着：requests 填得准，集群才能既调满又不崩。</>}
+/>
+
+## 这一节的落点
+
+- **requests 决定调度，limits 决定运行**；Pending 的唯一入口是 `describe` 里那段节点淘汰统计
+- 内存 limits == requests，CPU limits 可以放宽 —— 两者性质不同
+- 所有生产 Pod 必须设 requests，用 LimitRange 兜底
+- **容忍 ≠ 吸引**：定向调度需要容忍 + 亲和性两件一起配
+- `topologySpreadConstraints` 依赖节点标签，没打标签等于没配
+- PDB 是维护护栏，不是高可用手段；配成 `minAvailable == 副本数` 会永久卡住 drain
+- 分布式训练需要 gang scheduling，默认调度器做不到

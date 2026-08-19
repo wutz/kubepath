@@ -1,0 +1,276 @@
+手上快十倍，靠的不是记住更多命令，而是把 kubectl 当调查工具用、把清单管理交给对的工具。
+
+这一节是一份能立刻拿去用的配置与技巧集。
+
+## 先把环境配顺
+
+```bash
+cat << 'EOF' >> ~/.bashrc
+alias k=kubectl
+source <(kubectl completion bash)
+complete -o default -F __start_kubectl k    # 让 k 也有补全
+EOF
+source ~/.bashrc
+```
+
+补全比别名重要得多 —— 它让你不需要记资源类型的全名和 Pod 的随机后缀。
+
+## kubectl 当调查工具用
+
+### 输出控制
+
+```bash
+# 自定义列：比 -o wide 精确，适合做巡检
+kubectl get pod -o custom-columns=\
+'NAME:.metadata.name,NODE:.spec.nodeName,QOS:.status.qosClass,RESTARTS:.status.containerStatuses[0].restartCount'
+
+# 按重启次数排序，一眼看出哪个 Pod 在反复崩
+kubectl get pod -A --sort-by=.status.containerStatuses[0].restartCount | tail -20
+
+# 按事件时间排序 —— 默认顺序是乱的，这一条很有用
+kubectl get events -A --sort-by=.lastTimestamp | tail -30
+
+# 只取一个字段
+kubectl get pod web-0 -o jsonpath='{.spec.nodeName}'
+kubectl get node -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.memory}{"\n"}{end}'
+```
+
+<Callout type="tip" title="三条最高频的调查命令">
+```bash
+# 1. 这个命名空间里最近发生了什么
+kubectl get events -n <ns> --sort-by=.lastTimestamp | tail -30
+
+# 2. 这个节点上都跑着谁、requests 分配了多少
+kubectl describe node <node> | sed -n '/Non-terminated Pods/,/Events/p'
+
+# 3. 谁在占资源
+kubectl top pod -A --sort-by=memory | head -20
+```
+`describe node` 那一段尤其值钱：它同时给出节点上所有 Pod 的 requests 和总分配比例 —— 判断「还能不能调进去」用它，不要看 `top`（那是实际用量，和调度无关）。
+</Callout>
+
+### 排障姿势
+
+```bash
+# 上一个容器的日志：查 CrashLoopBackOff 必用
+kubectl logs web-0 --previous
+
+# 多容器 Pod 指定容器；跟随所有副本
+kubectl logs web-0 -c sidecar -f
+kubectl logs -l app=web --all-containers --tail=50 -f
+
+# 临时容器进 Pod 调试（1.25+）—— 不需要业务镜像里带工具
+kubectl debug web-0 -it --image=nicolaka/netshoot
+
+# 进节点调试 —— 起一个特权 Pod 挂宿主机根目录
+kubectl debug node/gn-10-128-1-1 -it --image=busybox
+
+# 端口转发，绕过 Ingress 直接测后端
+kubectl port-forward svc/web 8080:80
+
+# 验证权限，别靠读 YAML 猜
+kubectl auth can-i create deployments -n team-a
+kubectl auth can-i --list --as=system:serviceaccount:sa-management:dev
+```
+
+<Callout type="note" title="kubectl debug 解决了「镜像里没有 curl」这个老问题">
+生产镜像应该是精简的（distroless、无 shell），但这让 `kubectl exec` 进去几乎什么都干不了。
+
+`kubectl debug` 起一个**临时容器**加入目标 Pod 的 namespace —— 共享网络和进程视图，但用你指定的调试镜像。所以可以用 netshoot 的完整工具集去查一个 distroless 容器的网络问题，而不需要往生产镜像里塞工具。
+
+`kubectl debug node/<node>` 则是「不用 ssh 上节点」的排障方式：它起一个特权 Pod，宿主机根目录挂在 `/host` 下。
+</Callout>
+
+## 多集群与多命名空间
+
+原生的 `kubectl config use-context` 有个致命问题：**它改的是全局状态**。两个终端窗口共享同一个 current-context，你在这个窗口切到生产集群，另一个窗口也跟着切了 —— 然后在以为是测试环境的窗口里执行了删除。
+
+```bash
+brew install kubie
+echo 'alias kx=kubie' >> ~/.bashrc
+
+mkdir -p ~/.kube/configs
+cp zw1-k8s1.yaml ~/.kube/configs/
+cp hs1-k8s1.yaml ~/.kube/configs/
+
+kx ctx zw1-k8s1                    # 开一个新 shell，上下文只在这个 shell 里
+[zw1-k8s1|default] k get node
+[zw1-k8s1|default] kx ns kube-system
+[zw1-k8s1|kube-system] k get po
+```
+
+<Callout type="warn" title="上下文隔离不是洁癖，是防事故">
+`kubie` 的两个价值：
+
+1. **每个 shell 独立的上下文** —— 不会因为另一个窗口的操作而改变
+2. **提示符里显示当前集群和命名空间** —— 执行危险命令前，你看得见自己在哪
+
+「以为在测试环境，其实在生产」是运维事故里最常见的一类，而它几乎完全可以靠工具消除。命名习惯上把生产集群的名字写得显眼一点（比如加 `prod-` 前缀）也有帮助。
+</Callout>
+
+## kustomize：分层管理清单
+
+```bash
+mkdir myapp && cd myapp
+kustomize init
+kustomize edit add resource deployment.yaml service.yaml
+
+kubectl apply -k .          # kubectl 内置了 kustomize
+```
+
+真正的价值在 base / overlay 分层：
+
+```
+myapp/
+├── base/
+│   ├── kustomization.yaml
+│   ├── deployment.yaml
+│   └── service.yaml
+└── overlays/
+    ├── dev/
+    │   ├── kustomization.yaml     # replicas: 1，资源给小一点
+    │   └── patch-resources.yaml
+    └── prod/
+        ├── kustomization.yaml     # replicas: 6，加 PDB 和拓扑约束
+        └── patch-resources.yaml
+```
+
+```yaml
+# overlays/prod/kustomization.yaml
+resources:
+  - ../../base
+namespace: prod
+replicas:
+  - name: web
+    count: 6
+images:
+  - name: web
+    newTag: v1.4.2
+patches:
+  - path: patch-resources.yaml
+configMapGenerator:            # 自动给 ConfigMap 名字加 hash 后缀
+  - name: app-config
+    files: [config.yaml]
+```
+
+<Callout type="tip" title="configMapGenerator 顺手解决了配置热更新的问题">
+L1《工作负载对象》里讲过：ConfigMap 更新对 `subPath` 和 `env` 无效，而且应用不一定重读。
+
+`configMapGenerator` 会给生成的 ConfigMap 名字加一个内容 hash 后缀（`app-config-7f8d9c2b`），并自动改写所有引用它的地方。配置一变，ConfigMap 名字就变，Pod template 跟着变，**自然触发一次滚动更新**。
+
+这就把「热更新是否生效」这个不确定的问题，变成了确定的滚动发布。
+</Callout>
+
+## Helm 与 Helmwave
+
+Helm 适合装第三方组件（chart 生态就在那儿），但 `helm install` 手敲一遍是不可持续的 —— 参数记在谁的终端历史里？
+
+**Helmwave** 把一组 release 声明成一个文件：
+
+```yaml
+# helmwave.yml
+project: platform
+version: "0.41.0"
+
+repositories:
+  - name: jetstack
+    url: https://charts.jetstack.io
+
+releases:
+  - name: cert-manager
+    namespace: cert-manager
+    chart: jetstack/cert-manager
+    version: v1.16.2
+    create_namespace: true
+    values:
+      - values.yml
+```
+
+```bash
+helmwave up --build     # 部署或更新
+helmwave down           # 卸载
+```
+
+接一个新组件的标准流程：
+
+1. 搜到官方 chart 仓库，`helm repo add <name> <url>`
+2. `helm search repo <name>/` 看有哪些版本
+3. `helm show values <name>/<chart>` 拿到完整默认值
+4. 建 `values.yml`，**只写要改的部分**
+5. 建 `helmwave.yml` 描述这个 release
+6. `helmwave up --build`
+
+<Callout type="warn" title="values.yml 里只写要改的，别复制整份默认值">
+`helm show values` 输出往往几百行，很多人直接复制过来改几处。
+
+后果是升级 chart 时，那几百行里包含了旧版本的默认值 —— 新版本改过的默认值全被你的文件覆盖掉了，而你根本不知道自己在覆盖什么。
+
+只写差异项，剩下的交给 chart 的默认值跟着版本演进。想知道最终生效的完整配置用 `helm get values <release> --all`。
+</Callout>
+
+### release 卡住的处理
+
+```bash
+helm list -a -A                          # -a 显示所有状态，包括 pending
+helm history <release> -n <ns>
+
+# pending-upgrade / pending-install 卡住（通常是上次操作被中断）
+helm rollback <release> <上一个成功的 revision> -n <ns>
+
+# 实在恢复不了，删 release 记录但保留集群里的资源
+helm uninstall <release> -n <ns> --keep-history
+```
+
+## 其它趁手工具
+
+```bash
+# stern：同时跟多个 Pod 的日志，自动着色区分
+stern .                    # 当前命名空间所有 Pod
+stern web --since 10m      # 名字含 web 的，最近 10 分钟
+stern -l app=web --container app
+
+# kubectl-neat：把 apply 后被塞满的 managedFields、annotations 清掉
+kubectl get pod web-0 -o yaml | kubectl neat
+
+# 图形客户端：Headlamp
+```
+
+<Callout type="tip" title="stern 是查分布式问题的利器">
+一个请求经过 Ingress → 业务 Pod → sidecar，日志分散在三处。`kubectl logs` 一次只能看一个。
+
+`stern -l app=web` 把所有匹配 Pod 的日志合流，按 Pod 名着色。跨副本的问题（「只有某一个副本在报错」）用它几秒就能看出来。
+</Callout>
+
+<Quiz
+  id="tool-1"
+  question="想判断一个节点上还能不能调度进新 Pod，该看什么？"
+  options={[
+    { text: 'kubectl describe node 里的 Allocated resources —— 那是 requests 的分配情况', correct: true },
+    { text: 'kubectl top node 的实际使用率', feedback: 'top 显示的是实际用量，与调度无关。一个节点可能实际只用 20%，但 requests 已经分配光了，照样调不进去。' },
+    { text: 'kubectl get node 的 STATUS 列', feedback: 'Ready 只说明节点健康，不表示还有可分配资源。' },
+    { text: 'ssh 上去看 free -h', feedback: '容器里外的资源视图都会骗人，而且调度器看的是 requests 总和，不是实际空闲内存。' },
+  ]}
+  explain={<>调度器只看 requests（L1《调度器》），所以判断可调度性必须看 requests 的分配情况。<code>describe node</code> 的 <code>Allocated resources</code> 段落直接给出 CPU/内存的 requests 与 limits 总量及占 Allocatable 的百分比。实际用量和 requests 分配是两个独立维度 —— 「利用率只有 20% 但调不进去」正是 requests 填得过大的典型症状。</>}
+/>
+
+<Quiz
+  id="tool-2"
+  question="为什么推荐用 kubie 而不是 kubectl config use-context？"
+  options={[
+    { text: 'use-context 改的是全局状态，多个终端会互相影响', correct: true },
+    { text: 'kubie 给每个 shell 独立的上下文，并在提示符里显示当前集群', correct: true },
+    { text: 'kubie 支持更多的 kubectl 参数', feedback: 'kubie 不改变 kubectl 的功能，它只管上下文的作用域。' },
+    { text: 'use-context 不支持多集群', feedback: '它支持多集群，问题在于切换是全局的，不是每个 shell 独立的。' },
+  ]}
+  explain={<>这是一个防事故的工具选择。全局 current-context 意味着 A 窗口的切换会静默改变 B 窗口的目标集群 —— 「以为在测试环境，其实在生产」这类事故的直接成因。每 shell 独立 + 提示符可见，把这类风险基本消除。</>}
+/>
+
+## 这一节的落点
+
+- 先配好补全，它比记命令重要
+- 判断可调度性看 `describe node` 的 **Allocated resources（requests）**，不是 `top`
+- `logs --previous` 查 CrashLoop，`kubectl debug` 查精简镜像和节点
+- **用 kubie 做上下文隔离**，这是防事故不是洁癖
+- kustomize 的 `configMapGenerator` 顺手解决配置热更新的不确定性
+- Helm 的 `values.yml` **只写差异项**，别复制整份默认值
+- 组件用 Helmwave 声明式管理，别靠终端历史里的 `helm install`

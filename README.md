@@ -34,8 +34,9 @@
 | **L3** | 平台能力 | Cilium、服务暴露、网络策略、PV/PVC/CSI、存储接入、可观测性、镜像分发 |
 | **L4** | 进阶战场 | GPU Operator、AI 调度、训练与推理平台、多租户、容量规划、规模化、值班 |
 
-共 5 个阶段 **36 节课**，其中动手环节 15 节（12 个实验 + 2 个命令行闯关 + 1 个规划计算器），
-另有 1 个嵌在《控制面解剖》里的 apply 推演。目前 **7 节已完成正文**，其余为已定稿的小节大纲。
+共 5 个阶段 **36 节课，全部已完成正文**，其中动手环节 15 节（12 个实验 + 2 个命令行闯关 +
+1 个规划计算器），另有 1 个嵌在《控制面解剖》里的 apply 推演。正文含 64 个随堂检查点、
+158 个提示框、3 个命令行演练。
 
 线上地址：<https://kubepath.wutz.dev>
 
@@ -126,7 +127,7 @@ kubepath/
 │   │   ├── ClusterCapacityPlanner.tsx   # 集群容量计算器
 │   │   ├── mdx-components.tsx           # MDX 全局组件表
 │   │   └── lesson-context.ts            # 当前课程 key，供交互组件写进度
-│   ├── content/                 # 课程正文
+│   ├── content/                 # 36 节课程正文
 │   │   ├── l0-foundation/       # 6 节
 │   │   ├── l1-core/             # 7 节
 │   │   ├── l2-cluster/          # 8 节
@@ -197,8 +198,8 @@ RWO 是单节点读写，不是单 Pod —— 同节点上的多个 Pod 能共�
 
 ## 后续可做
 
-- 补齐其余 29 节正文（当前 7 节有正文，其余为已定稿大纲）
 - 调度推演组件：改 requests / 污点 / 亲和性，看 Pod 落在哪台节点
-- L2 的 NotReady 闯关与 etcd 恢复演练
+- etcd 恢复演练：把《etcd 运维》的 snapshot restore 做成命令行闯关
+- Kueue 配额推演：改 nominalQuota 与 borrowingLimit，看任务准入与借用
 - 深色模式（Shiki 已按双主题编译，接一个切换即可）
 - 全站搜索

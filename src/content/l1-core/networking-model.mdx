@@ -1,0 +1,267 @@
+K8s 网络的所有复杂度，都建立在三条极简的约定之上。先记住这三条，后面 Service、CNI、DNS 的行为都是它们的推论。
+
+## 三条约定
+
+```
+1. 每个 Pod 有自己的 IP，且这个 IP 在整个集群里唯一
+2. Pod 之间可以直接用这个 IP 通信，不经过 NAT
+3. 节点上的进程可以直接访问本节点的 Pod，不经过 NAT
+```
+
+第二条是最关键的：**扁平网络，没有 NAT**。所以 Pod A 看到的自己的 IP，和 Pod B 看到的 A 的 IP，是同一个 —— 这让分布式系统里那些依赖「对端上报自己地址」的协议（数据库集群、消息队列、NCCL）能直接跑起来。
+
+CNI 的职责就是实现这三条，具体怎么实现（隧道、路由、eBPF）由插件自己决定。
+
+<Callout type="note" title="CNI 做什么、不做什么">
+**CNI 做的**：Pod 起来时给它建 network namespace、分配 IP、配路由，让它满足上面三条约定。就这么多。
+
+**CNI 不做的**：Service 的负载均衡、DNS 解析、Ingress。这些是 kube-proxy、CoreDNS 和 Ingress 控制器的活。
+
+Cilium 这类插件会**顺带**把 kube-proxy 的活也接过去（`kubeProxyReplacement`），但那是它的额外功能，不是 CNI 规范的一部分。分清这个边界，排障时才知道该查哪个组件。
+</Callout>
+
+## Pod IP 是临时的，所以有了 Service
+
+Pod 会被重建，IP 会变。业务不可能追着 IP 跑，于是需要一个稳定的入口 —— Service。
+
+| 类型 | 拿到什么 | 谁实现 | 用在哪 |
+| --- | --- | --- | --- |
+| **ClusterIP** | 一个集群内的虚拟 IP | kube-proxy | 集群内部访问，默认类型 |
+| **Headless** | 不给 IP，DNS 直接返回所有 Pod IP | CoreDNS | StatefulSet、客户端自己管连接 |
+| **NodePort** | 每个节点上开一个静态端口 | kube-proxy | 简单外部暴露、调试 |
+| **LoadBalancer** | 一个可路由的外部 IP | MetalLB / 云厂商 | 生产的外部入口 |
+
+```yaml
+apiVersion: v1
+kind: Service
+spec:
+  type: ClusterIP
+  selector: { app: web }        # 靠标签选 Pod，不是靠名字
+  ports:
+    - port: 80                  # Service 的端口
+      targetPort: 8080          # 容器的端口
+```
+
+<Callout type="warn" title="ClusterIP 不能 ping，这是正常的">
+ClusterIP 是一个**虚拟地址**，它不属于任何网卡，没有任何东西会响应 ICMP。它只在 iptables / eBPF 的 DNAT 规则里存在。
+
+所以 `ping <clusterIP>` 不通完全正常，用它判断 Service 是否健康是错的。正确的验证方式是访问实际端口：
+
+```bash
+kubectl run -it --rm net --image=nicolaka/netshoot -- \
+  curl -sv http://web.default.svc.cluster.local:80
+```
+</Callout>
+
+### Headless Service：给 StatefulSet 用的那种
+
+```yaml
+spec:
+  clusterIP: None              # 这一行就是 headless
+  selector: { app: mysql }
+```
+
+结果是 DNS 查询直接返回 Pod IP 列表，而且每个 Pod 有自己的名字：
+
+```
+mysql.default.svc.cluster.local        → 10.244.1.5, 10.244.2.7, 10.244.3.9
+mysql-0.mysql.default.svc.cluster.local → 10.244.1.5     ← 稳定的单实例地址
+```
+
+数据库集群需要的正是后者：从库要能通过固定地址找到主库，而不是被负载均衡随机分发。
+
+## Service 是怎么真的转发的
+
+一个关键认知：**Service 的转发发生在客户端所在的节点上**，不是在某个中心节点。
+
+```
+Pod A（节点 1）  curl 10.96.0.10:80
+     │
+     ├─ 节点 1 的 iptables / eBPF 规则命中 ClusterIP
+     ├─ DNAT 改写目标地址 → 随机选一个后端 Pod IP
+     ▼
+Pod B（节点 3）  收到的是直接发给它的包
+```
+
+所以没有单点瓶颈，但也意味着：**每个节点都要维护全量的 Service 规则**。
+
+| kube-proxy 模式 | 数据结构 | 规模表现 |
+| --- | --- | --- |
+| `iptables` | 线性匹配的规则链 | Service 多了规则数爆炸，同步慢 |
+| `ipvs` | 内核哈希表 | O(1) 查找，大规模明显更好 |
+| Cilium eBPF | eBPF map | 不生成 iptables 规则，规模与延迟都最好 |
+
+```bash
+kubectl -n kube-system get cm kube-proxy -o yaml | grep mode
+```
+
+<Callout type="tip" title="大集群优先 ipvs 或 eBPF">
+iptables 模式下，每个 Service 每个后端都要几条规则。几千个 Service 就是几万条规则，而 iptables 是**线性匹配**的：
+
+- 数据面：每个包的匹配开销随规则数增长
+- 控制面：规则变更要全表刷新，Service 变动频繁时 kube-proxy 的 CPU 会打满，规则同步延迟到几十秒 —— 表现是「新 Pod 起来了但流量进不去」
+
+换 ipvs 只需要改 kube-proxy 的 mode 并重启；用 Cilium 的 `kubeProxyReplacement` 则直接不需要 kube-proxy。
+</Callout>
+
+## externalTrafficPolicy：一个影响源 IP 的开关
+
+对 NodePort 和 LoadBalancer，这个字段决定流量进来之后怎么走：
+
+| 值 | 行为 | 源 IP | 负载均衡 |
+| --- | --- | --- | --- |
+| `Cluster`（默认） | 可以转给其它节点上的 Pod | **被 SNAT 掉，丢失真实客户端 IP** | 均匀 |
+| `Local` | 只转给本节点的 Pod | **保留真实客户端 IP** | 取决于 Pod 分布 |
+
+```yaml
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+```
+
+<Callout type="trap" title="拿不到真实客户端 IP，八成是这个">
+「日志里所有请求的来源 IP 都是节点 IP」是个高频问题。原因就是默认的 `Cluster` 策略要做 SNAT（否则回包会走错路）。
+
+改成 `Local` 能保留源 IP，但有代价：**没有该 Service 后端 Pod 的节点会直接拒绝连接**。所以配 `Local` 时必须保证 Pod 在每个入口节点上都有 —— 要么用 DaemonSet，要么配好拓扑分布。
+
+另一条路是让 Ingress 通过 `X-Forwarded-For` 头传递源 IP，应用侧读这个头。七层入口通常用这个方案。
+</Callout>
+
+## CoreDNS 与 ndots 陷阱
+
+集群内的名字解析规则：
+
+```
+<service>.<namespace>.svc.cluster.local     完整形式
+<service>.<namespace>                       同集群跨命名空间
+<service>                                   同命名空间
+```
+
+容器里的 `/etc/resolv.conf` 长这样：
+
+```
+nameserver 10.96.0.10
+search default.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+```
+
+<Callout type="trap" title="ndots:5 让每次访问外部域名都多查好几次">
+`ndots:5` 的含义是：**域名里的点少于 5 个时，先依次拼接 search 域去查**。
+
+于是解析 `api.github.com`（2 个点）的实际过程是：
+
+```
+api.github.com.default.svc.cluster.local   → NXDOMAIN
+api.github.com.svc.cluster.local           → NXDOMAIN
+api.github.com.cluster.local               → NXDOMAIN
+api.github.com                             → 终于命中
+```
+
+4 次查询才成功。这在访问外部服务频繁的应用上会显著放大 CoreDNS 的负载，也让每个请求多出几毫秒延迟。高 QPS 服务上这个开销很可观。
+
+两种解决办法：
+
+```yaml
+# 一：域名末尾加点，声明这是完整域名，跳过 search
+#     https://api.github.com./v1/...
+
+# 二：给 Pod 单独调低 ndots
+spec:
+  dnsConfig:
+    options:
+      - name: ndots
+        value: "2"
+```
+
+集群侧还可以部署 **NodeLocal DNSCache**，在每个节点上放一个 DNS 缓存，把大部分查询挡在本地 —— 这是大集群的标准配置。
+</Callout>
+
+## 南北向：Ingress 与 Gateway API
+
+Service 解决集群内的东西向，外部流量进来是另一层：
+
+```
+外部客户端
+   │
+   ▼
+LoadBalancer Service（MetalLB 分配 IP）
+   │
+   ▼
+Ingress 控制器 Pod（nginx / Envoy）   ← 七层：域名、路径、TLS、重写
+   │
+   ▼
+后端 Service → Pod
+```
+
+| | Ingress | Gateway API |
+| --- | --- | --- |
+| 状态 | 稳定，生态最广 | 新一代标准，逐步取代 Ingress |
+| 表达力 | 弱，高级功能靠注解 | 原生支持流量切分、header 匹配等 |
+| 角色分离 | 无，一个对象混了平台和应用的关注点 | **有**：GatewayClass / Gateway / HTTPRoute 分属不同角色 |
+
+新项目建议直接上 Gateway API —— 它的角色分离对多团队平台特别有价值：平台团队管 Gateway，业务团队各自管自己的 HTTPRoute，互不干扰。
+
+## 排查一次「Pod 之间不通」
+
+按这个顺序走，逐层排除：
+
+```bash
+# 1. Pod 有 IP 吗 —— 没有就是 CNI 的问题
+kubectl get pod -o wide
+
+# 2. Pod 到 Pod 直连通吗 —— 这一步验证的是 CNI，与 Service 无关
+kubectl exec -it web-0 -- curl -s 10.244.2.7:8080
+
+# 3. DNS 解析对吗
+kubectl exec -it web-0 -- nslookup web.default.svc.cluster.local
+
+# 4. Service 有 endpoints 吗 —— 空的话是 selector 和 Pod 标签对不上
+kubectl get endpointslices -l kubernetes.io/service-name=web
+
+# 5. 通过 ClusterIP 访问
+kubectl exec -it web-0 -- curl -s web.default.svc.cluster.local
+
+# 6. 有 NetworkPolicy 拦着吗
+kubectl get netpol -A
+```
+
+<Callout type="tip" title="endpoints 为空是最常见的原因">
+Service 有 ClusterIP、DNS 也能解析，就是连不上 —— 先看 endpoints。
+
+空的话有三种可能：**selector 和 Pod 标签不匹配**（最常见，通常是拼写或大小写）、**Pod 的 readinessProbe 没过**（没就绪的 Pod 不会进 endpoints）、**targetPort 写错**。
+
+这三个都不需要碰网络层就能确认，所以应该排在网络排查的最前面。
+</Callout>
+
+<Quiz
+  id="net-1"
+  question="Pod 访问 ClusterIP 时，有些时候通有些时候不通，取决于目标 Pod 是否恰好在同一节点上。最可能是什么原因？"
+  options={[
+    { text: '节点没加载 br_netfilter，桥接流量绕过了 iptables 的 DNAT 规则', correct: true },
+    { text: 'CoreDNS 挂了', feedback: 'DNS 有问题的话解析就失败了，不会表现出「跨节点通、同节点不通」这种和拓扑相关的规律。' },
+    { text: 'Service 的 selector 写错了', feedback: 'selector 错会导致 endpoints 为空，所有访问一律失败，不会时通时不通。' },
+    { text: 'ClusterIP 不能 ping', feedback: 'ping 不通是正常现象，与实际端口能否访问无关。' },
+  ]}
+  explain={<>「结果取决于目标 Pod 在不在同一节点」是一个非常特征化的信号：同节点内的流量走网桥，跨节点的走路由。<code>br_netfilter</code> 决定桥接流量是否经过 iptables —— 没有它，同节点的包绕过了 kube-proxy 的 DNAT，ClusterIP 解析不到后端；而跨节点的包走路由，不受影响。这就是 L0《节点 OS 基线》要把这个模块列进检查清单的原因。</>}
+/>
+
+<Quiz
+  id="net-2"
+  question="一个高 QPS 服务频繁访问外部 API，发现 CoreDNS 负载很高。以下哪些能缓解？"
+  options={[
+    { text: '给 Pod 配 dnsConfig 把 ndots 调低', correct: true },
+    { text: '在外部域名末尾加一个点，声明为完整域名', correct: true },
+    { text: '部署 NodeLocal DNSCache，把查询挡在节点本地', correct: true },
+    { text: '把 Service 类型改成 Headless', feedback: 'Headless 改变的是集群内 Service 的解析方式，与访问外部域名的查询次数无关。' },
+  ]}
+  explain={<>根因是 <code>ndots:5</code>：解析 <code>api.github.com</code>（2 个点）会先拼三个 search 域各查一次，一共 4 次查询才成功。三个正确选项分别从三个层面解决 —— 改 Pod 的 ndots（减少拼接）、写全域名（跳过 search）、加本地缓存（把重复查询挡在节点上）。大集群里 NodeLocal DNSCache 基本算标配。</>}
+/>
+
+## 这一节的落点
+
+- 三条约定：**每 Pod 一个唯一 IP、Pod 间无 NAT 直通、节点可直连本机 Pod**；CNI 只负责实现这三条
+- **Service 的转发发生在客户端所在节点**，所以没有单点，但每个节点都要维护全量规则 —— 大集群用 ipvs 或 eBPF
+- ClusterIP ping 不通是正常的；连不上先查 endpoints 是否为空
+- 拿不到真实客户端 IP → `externalTrafficPolicy`；配 `Local` 要保证每个入口节点都有后端 Pod
+- `ndots:5` 会让外部域名多查好几次，高 QPS 服务要处理
+- 排查顺序：Pod 有 IP → Pod 直连 → DNS → **endpoints** → ClusterIP → NetworkPolicy

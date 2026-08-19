@@ -1,0 +1,177 @@
+「三台管理节点 + 若干计算节点」这句话，落到订单上有几十种配法。而配错的代价不是慢一点 —— GPU 集群里 CPU 或网卡配错，训练性能能差一倍。
+
+这一节给三类节点各开一份配置，并解释每个数字背后的约束。
+
+## 控制面节点
+
+控制面的负载来自**对象数量与 watch 连接数**，不来自业务流量。所以它的规格跟着集群规模走：
+
+| 计算节点数 | CPU | 内存 | etcd 盘 |
+| --- | --- | --- | --- |
+| ≤ 10 | 4 核 | 8 GiB | 独占 NVMe，200G 够 |
+| ≤ 50 | 8 核 | 16 GiB | 独占 NVMe |
+| ≤ 250 | 16 核 | 32 GiB | 独占 NVMe，单独一块 |
+| ≤ 500 | 16 核 | 64 GiB | 独占 NVMe，考虑 5 节点 etcd |
+| > 500 | 32 核 | 128 GiB | 认真评估拆集群 |
+
+三条硬性要求：
+
+1. **etcd 独占一块本地 NVMe** —— 不与系统盘共享，不用任何网络存储（见《etcd 磁盘验收》）
+2. **内存要给 apiserver 留足** —— apiserver 会缓存集群里所有对象，大集群里它是内存消耗的主体
+3. **控制面节点不要跑业务** —— 默认的 `node-role.kubernetes.io/control-plane:NoSchedule` 污点别去掉
+
+<Callout type="warn" title="控制面跨机架，不要跨机房">
+控制面节点分散到不同机架、不同电源，是为了避免单机架故障带走 quorum。这是对的。
+
+但**不要跨机房**：etcd 的每次写提案都要等多数节点 fsync 确认，跨机房的网络往返（哪怕同城，也有 1–3ms）会直接叠加到集群的写延迟上。跨机房高可用应该用多集群方案，而不是把一个 etcd 集群拉长。
+</Callout>
+
+## CPU 计算节点
+
+选规格的核心权衡是**资源效率 vs 爆炸半径**：
+
+| 规格 | 系统预留占比 | 单机故障影响 | 适合 |
+| --- | --- | --- | --- |
+| 8C32G | 内存约 8% | 小 | 边缘、小集群 |
+| 32C128G | 内存约 7% | 中 | 通用业务，最常见 |
+| 64C512G | 内存约 3% | 大 | 高密度、大内存服务 |
+| 128C2T | 内存约 2% | 很大 | 一般是 GPU 机型带的 |
+
+大机器的资源效率明显更高（预留比例从 8% 降到 2%），但 5 台超大节点里坏 1 台就是丢 20% 算力。**中等规格通常是最优解**，具体的账可以用 L4 的容量计算器算。
+
+另外两个容易漏的点：
+
+```bash
+# 系统盘：容器镜像层和容器日志都写在这
+# /var/lib/containerd 和 /var/log/pods 是两个大户，建议 500G 以上 SSD
+# 高密度节点可以把它们 bind mount 到单独一块 NVMe
+
+# 网卡：Pod 密度高的节点，10G 起步；有大量东西向流量的上 25G
+```
+
+## GPU 计算节点
+
+GPU 节点的机型基本由卡决定，真正需要你判断的是**周边配比**。
+
+### 每卡该配多少 CPU 和内存
+
+GPU 负责算，但数据的读取、解码、增强都在 CPU 上。CPU 不够，GPU 就在等数据：
+
+| 场景 | 每卡 CPU | 每卡内存 |
+| --- | --- | --- |
+| LLM 训练（数据预处理轻） | 8–12 核 | 96–128 GiB |
+| CV 训练（大量图像解码） | 12–16 核 | 128–256 GiB |
+| 推理服务 | 4–8 核 | 32–64 GiB |
+
+<Callout type="trap" title="八卡机配 64 核，是个很贵的省钱">
+八卡 A100/H100 配 2×32 核（共 64 核），每卡摊到 8 核 —— 减掉系统预留还不到 7.9 核。跑 CV 训练时 GPU 利用率上不去，而所有人的第一反应都是去查网络和存储。
+
+同规格配到 2×64 核（共 128 核）通常只贵一点，每卡 16 核，数据管道就不再是瓶颈。这笔账在采购阶段算成本为零，集群跑起来之后算就是换 CPU。
+</Callout>
+
+### PCIe 拓扑与 NUMA 亲和
+
+一台八卡机内部不是「八张卡平等地连在一起」。GPU、网卡、CPU 分别挂在不同的 PCIe root complex 下，而每个 root complex 属于某个 NUMA node：
+
+```bash
+# 看 GPU 之间的互联方式
+nvidia-smi topo -m
+
+#         GPU0  GPU1  GPU2  GPU3  ...  NIC0  CPU Affinity  NUMA
+# GPU0     X    NV12  NV12  NV12       PXB   0-31,64-95    0
+# GPU1   NV12    X    NV12  NV12       PXB   0-31,64-95    0
+# GPU4   SYS   SYS   SYS   SYS         PXB   32-63,96-127  1
+```
+
+读法：
+
+| 标记 | 含义 | 带宽 |
+| --- | --- | --- |
+| `NV#` | NVLink 直连，# 是链路数 | 最高 |
+| `PIX` / `PXB` | 同一 PCIe switch 下 | 高 |
+| `NODE` | 同 NUMA，跨 switch | 中 |
+| `SYS` | 跨 NUMA，要过 CPU 互联（UPI/xGMI） | 最低 |
+
+**关键结论**：一个八卡训练任务，如果 GPU 和它用的网卡不在同一 NUMA，RDMA 流量要跨 CPU 互联，实测带宽可能只有一半。所以：
+
+- 每个 NUMA node 配至少一张 RDMA 网卡，做成 GPU–NIC 一一对应或就近配对
+- 集群侧要开拓扑感知（`nvidia.com/gpu` 的 topology manager 策略、NFD 打标签）
+- 训练框架侧要正确设置 `NCCL_IB_HCA`、`NCCL_SOCKET_IFNAME`
+
+### 网络：什么时候需要 RDMA
+
+| 场景 | 网络 | 理由 |
+| --- | --- | --- |
+| 单机多卡训练 | 以太网 25G 够 | 卡间走 NVLink，不出机器 |
+| 多机训练，≤ 8 机 | RoCE 100G | AllReduce 流量大，延迟敏感 |
+| 多机训练，大规模 | RoCE / IB 200G+，每卡一张 | 通信占比会超过计算 |
+| 推理服务 | 以太网 25G | 请求小，吞吐由 GPU 决定 |
+
+<Callout type="note" title="RoCE 还是 InfiniBand">
+两者在 K8s 侧的接入方式类似（都通过 `network-operator` 提供设备支持，用 Multus 或 Spiderpool 给 Pod 挂第二张网卡）。差别在运维模型：
+
+- **RoCE** 跑在以太网上，复用现有交换机与运维体系，但**必须正确配置无损网络**（PFC / ECN），配不对性能会断崖式下跌，而且难查
+- **InfiniBand** 是独立网络，性能与延迟更稳，代价是一整套独立的交换机、线缆和运维知识（子网管理器等）
+
+已有以太网运维能力、规模不大 → RoCE。规模大、对稳定性要求高、有 IB 运维经验 → IB。这个选择一旦定下来，改动成本非常高。
+</Callout>
+
+## 故障域：让物理布局能被调度器看见
+
+机架、电源、交换机的分组，最终要变成节点标签，调度器才能用：
+
+```bash
+kubectl label node gn-10-128-1-1 topology.kubernetes.io/zone=rack-a
+kubectl label node gn-10-128-1-1 topology.kubernetes.io/region=zw1
+```
+
+有了标签，业务才能写出真正有效的高可用约束：
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels: { app: web }
+```
+
+<Callout type="warn" title="没打标签，「三副本」是假的高可用">
+Deployment 配了 3 副本，调度器在没有任何约束时完全可能把它们放到同一个机架的三台机器上 —— 甚至同一台机器（如果资源够）。
+
+机架掉电，三个副本一起消失。这个问题在测试环境永远暴露不出来，因为测试环境本来就只有一个机架。
+
+**装机时就把机架标签打上**，成本几乎为零；出过一次事故之后再补，就是一次全集群变更。
+</Callout>
+
+<Quiz
+  id="hw-1"
+  question="八卡 H100 训练集群，实测多机 AllReduce 带宽只有理论值的一半。以下哪些是合理的排查方向？"
+  options={[
+    { text: '用 nvidia-smi topo -m 确认 GPU 与 RDMA 网卡是否在同一 NUMA', correct: true },
+    { text: '检查 RoCE 的 PFC / ECN 无损网络配置是否正确', correct: true },
+    { text: '检查 NCCL_IB_HCA 等环境变量是否绑到了正确的网卡', correct: true },
+    { text: '给节点加内存', feedback: 'AllReduce 是通信瓶颈，与节点内存容量无关。' },
+    { text: '提高 Pod 的 CPU limits', feedback: 'CPU 不足会表现为 GPU 等数据（利用率低），不会表现为通信带宽腰斩。' },
+  ]}
+  explain={<>「带宽正好差一半」是很典型的拓扑问题信号：流量跨了 NUMA，要过 CPU 互联。三个正确选项对应三层原因 —— 硬件拓扑（GPU 与 NIC 的 NUMA 归属）、网络配置（RoCE 必须无损，PFC/ECN 配不对性能断崖下跌）、软件绑定（NCCL 用错网卡）。这三层都要在集群交付前用 <code>nccl-tests</code> 实测过，不能只看规格书。</>}
+/>
+
+## 交付给采购的三张配置单
+
+| | 控制面 ×3 | CPU 计算 ×N | GPU 计算 ×M |
+| --- | --- | --- | --- |
+| CPU | 16 核 | 2×32 核 | 2×64 核 |
+| 内存 | 32 GiB | 256 GiB | 2 TiB |
+| 系统盘 | 480G SSD | 960G SSD | 960G SSD |
+| 数据盘 | **etcd 独占 NVMe** | 按需 | 本地 NVMe 做数据缓存 |
+| GPU | — | — | 8× H100 SXM |
+| 业务网卡 | 25G ×2 | 25G ×2 | 25G ×2 |
+| RDMA 网卡 | — | — | **每 NUMA 至少 1 张 200G** |
+| 分布 | 跨 3 机架，不跨机房 | 摊到多机架 | 按 NUMA 配平 |
+
+三个必须在交付前实测、不能只看规格书的项：
+
+1. **etcd 盘** —— `fio --fdatasync=1`，p99 < 3ms
+2. **GPU 拓扑** —— `nvidia-smi topo -m`，确认 NVLink 与 NIC 的 NUMA 归属
+3. **多机通信** —— `nccl-tests` 的 all_reduce_perf，对比理论带宽

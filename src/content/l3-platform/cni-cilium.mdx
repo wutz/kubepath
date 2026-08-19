@@ -1,0 +1,233 @@
+CNI 是集群建成后**最难改的决定之一** —— 换 CNI 基本等于重建网络平面，所有 Pod 都要重启，Pod IP 全变。
+
+所以这一节的顺序是：先讲清选型依据，再动手装。
+
+## 主流 CNI 的路线差异
+
+| CNI | 数据面 | 特点 | 代价 |
+| --- | --- | --- | --- |
+| **Flannel** | VXLAN / host-gw | 最简单，几乎零配置 | 无 NetworkPolicy，性能一般 |
+| **Calico** | iptables / eBPF / BGP | 成熟，策略能力强，BGP 生态好 | iptables 模式规模化后规则膨胀 |
+| **Cilium** | **eBPF** | 性能最好，可替换 kube-proxy，L7 策略，Hubble 可观测 | 依赖较新内核，概念多 |
+| **Kube-OVN** | OVS | 子网、VPC、固定 IP 等虚拟化能力 | 组件多，运维复杂 |
+
+选型的三个判断点：
+
+1. **要不要 NetworkPolicy** —— 多租户场景必须要，Flannel 直接出局
+2. **规模与性能** —— 上百节点、Service 多、延迟敏感 → eBPF 路线
+3. **底层网络能否配合** —— 能跑 BGP 就用原生路由（无隧道开销）；不能就只能隧道
+
+<Callout type="note" title="为什么选 Cilium">
+对 K8s + GPU 混合负载的集群，Cilium 的三个能力是决定性的：
+
+1. **eBPF 数据面** —— 不生成 iptables 规则，Service 数量增长时数据面和控制面都不退化（L1《网络模型》讲过 iptables 的线性匹配问题）
+2. **替换 kube-proxy** —— 少一个组件，少一层转发开销
+3. **L7 策略与 Hubble** —— 策略能写到 HTTP 方法/路径级别，Hubble 让「哪个 Pod 在和谁通信」变成可观测的
+
+代价是需要 5.10+ 内核，且概念比 Flannel 多得多 —— 出问题时要懂 eBPF 的调试方式，而不是看 iptables 规则。
+</Callout>
+
+## 部署前：几个必须先确认的点
+
+### 1. 路由表冲突
+
+```bash
+ip rule list
+cat /etc/iproute2/rt_tables
+```
+
+Cilium 会占用 route table **200 / 202 / 2004 / 2005**。宿主机的多网卡策略路由、RDMA 网络配置如果也用了这些表号，会导致网络异常 —— 而且现象很难定位（偶发丢包、部分流量走错）。
+
+有冲突就改宿主机的网络配置，装之前改，成本最低。
+
+### 2. Pod CIDR
+
+```yaml
+# values.yml
+ipam:
+  mode: cluster-pool
+  operator:
+    clusterPoolIPv4PodCIDRList:
+      - 172.24.0.0/13         # 必须与 kubespray 的 kube_pods_subnet 一致
+    clusterPoolIPv4MaskSize: 24
+```
+
+这两个值要和 L2《把规划写进配置》里的 `kube_pods_subnet` / `kube_network_node_prefix` **完全对齐**。不一致会出现 Pod 拿到的 IP 与集群路由预期不符。
+
+### 3. apiserver 直连地址
+
+```yaml
+k8sServiceHost: 127.0.0.1      # kubespray 部署的集群推荐这个
+k8sServicePort: 6443
+```
+
+<Callout type="warn" title="k8sServiceHost 填错会导致启动期死锁">
+Cilium 的 init 容器需要连 apiserver，但此时 **Cilium 本身还没就绪，ClusterIP 还不能用** —— 如果让它通过 `kubernetes.default` 这个 ClusterIP 去连，就形成了循环依赖。
+
+三个选项，优劣分明：
+
+| 值 | 说明 |
+| --- | --- |
+| `127.0.0.1` | **推荐**。kubespray 在每个节点起了 nginx 代理转发到所有控制面，天然 HA |
+| VIP（如 `192.168.3.101`） | 可用，但依赖外部负载均衡先就绪 |
+| `auto` | **不要用**。它从 `kube-public/cluster-info` 读，而 kubeadm 写进去的是单个 master 的 IP，没有 HA |
+
+填 `auto` 的集群在那台 master 维护时，新起的 Cilium Pod 会连不上 apiserver。
+</Callout>
+
+### 4. 已知 bug 的规避
+
+```yaml
+bpf:
+  enableTCX: false      # 规避 TCX BPF 程序清理不干净的 bug
+```
+
+这类版本特定的开关，装之前要查一遍上游的 known issues。
+
+## 部署
+
+```bash
+# 用 helmwave 管理，配置进版本库
+helmwave up --build
+
+# 等待就绪
+kubectl -n kube-system rollout status ds/cilium
+kubectl -n kube-system get pod -l k8s-app=cilium -o wide
+```
+
+替换 kube-proxy 的配置：
+
+```yaml
+kubeProxyReplacement: true
+# 开启后可以把 kube-proxy 从集群里移除（kubespray 侧设 kube_proxy_remove: true）
+```
+
+## 验证
+
+```bash
+# 1. Cilium 自己的状态报告 —— 最直接的健康检查
+kubectl -n kube-system exec ds/cilium -- cilium-dbg status --verbose
+
+# 关注这几行：
+#   KubeProxyReplacement:   True
+#   Cilium:                 Ok
+#   IPAM:                   IPv4: 12/254 allocated
+#   Host Routing:           BPF
+#   Masquerading:           BPF
+
+# 2. 内置的连通性测试 —— 会建一个命名空间跑几十个用例
+cilium connectivity test
+
+# 3. 手工验证 Pod 到 Pod、Pod 到 Service
+kubectl run -it --rm net --image=nicolaka/netshoot -- sh
+```
+
+<Callout type="tip" title="cilium-dbg status 是排障第一站">
+它一次给出 IPAM 用量、数据面模式、kube-proxy 替换状态、以及各子系统的健康状况。
+
+尤其是 `IPAM: IPv4: 12/254 allocated` 这一行 —— **IP 池耗尽是 `FailedCreatePodSandBox` 的常见原因**（L0《运行时与 CRI》讲过这个报错指向 CNI）。看到 254/254 就知道要扩 CIDR 了。
+</Callout>
+
+## Pod CIDR 用尽了怎么办
+
+这是一个会真实遇到的问题：集群扩容到一定规模，新节点上的 Pod 起不来。
+
+```bash
+# 症状
+kubectl describe pod xxx
+# FailedCreatePodSandBox ... failed to allocate IP
+```
+
+**不能修改已有的地址段**（会影响正在运行的 Pod），只能追加新段：
+
+```yaml
+# values.yml
+ipam:
+  operator:
+    clusterPoolIPv4PodCIDRList:
+      - 172.24.0.0/13        # 原有的，保持不动
+      - 172.32.0.0/13        # 新增
+```
+
+```bash
+helmwave up --build
+kubectl rollout restart deployment/cilium-operator -n kube-system
+```
+
+<Callout type="warn" title="新增的段要确认路由可达">
+如果集群用的是原生路由模式（非隧道），新增的 Pod CIDR 段需要在**底层网络上也能路由** —— 交换机或 BGP 侧要知道这个新网段在哪些节点上。
+
+隧道模式（VXLAN/Geneve）不需要，因为 Pod 流量被封装在节点 IP 之间传输。这也是隧道模式虽然有额外开销、但部署更省事的原因。
+</Callout>
+
+## Hubble：让网络可观测
+
+```bash
+# values.yml 里开启
+# hubble:
+#   enabled: true
+#   relay: { enabled: true }
+#   ui: { enabled: true }
+
+# 实时看流量，这在排查「为什么不通」时非常直接
+hubble observe --namespace default --follow
+hubble observe --from-pod default/web-0 --to-port 5432
+hubble observe --verdict DROPPED          # 只看被丢弃的
+```
+
+`--verdict DROPPED` 是排查 NetworkPolicy 问题的利器：它直接告诉你**哪条策略丢了哪个包**，而不用去反推策略的交集。
+
+## 与底层网络的配合
+
+| 项 | 说明 |
+| --- | --- |
+| **隧道 vs 原生路由** | 隧道（VXLAN/Geneve）省事但有封装开销与 MTU 损耗；原生路由性能最好，要求底层能路由 Pod CIDR |
+| **BGP** | Cilium 可以直接和交换机建 BGP 邻居，把 Pod CIDR 和 LoadBalancer IP 宣告出去 |
+| **MTU** | 隧道模式下 Pod MTU 要减去封装开销（VXLAN 50 字节）。配错的表现是**小包通、大包不通** |
+| **RDMA** | Cilium 管主网卡；RDMA 通常用 Multus / Spiderpool 给 Pod 挂第二张网卡 |
+
+<Callout type="trap" title="MTU 配错的现象：ssh 能连上但 ls 卡住">
+这是网络问题里最迷惑的一类：TCP 握手（小包）正常，一传大数据就卡死。
+
+原因是 MTU 不匹配 + PMTU 发现被防火墙挡了（ICMP 被禁）。表现包括：`curl` 小接口正常大响应超时、`ssh` 登录成功但 `ls` 大目录卡住、镜像拉取到一半停住。
+
+```bash
+# 验证：从 Pod 里发不分片的大包
+kubectl exec -it web-0 -- ping -M do -s 1400 <对端 Pod IP>
+```
+Cilium 通常能自动探测 MTU，但在有隧道叠加（比如底层已经是 VXLAN 的虚拟化网络）的环境里需要手工设 `MTU` 值。
+</Callout>
+
+<Quiz
+  id="cni-1"
+  question="Cilium 的 k8sServiceHost 为什么不该填 auto？"
+  options={[
+    { text: 'auto 从 kube-public/cluster-info 读，kubeadm 写入的是单个 master IP，没有 HA', correct: true },
+    { text: 'auto 会导致 Cilium 无法启动', feedback: '能启动，问题在于它绑定到了单个控制面节点 —— 那台节点维护时新起的 Cilium Pod 才会失败。' },
+    { text: 'auto 只支持单节点集群', feedback: '它在多节点集群也能工作，只是不具备高可用。' },
+    { text: 'auto 会绕过 TLS 验证', feedback: '与证书验证无关。' },
+  ]}
+  explain={<>Cilium 的 init 容器必须在 Cilium 就绪<strong>之前</strong>连上 apiserver，所以不能走 ClusterIP（循环依赖）。<code>auto</code> 的问题是它拿到的地址指向单台 master，这个隐患平时看不出来 —— 直到那台节点维护，新调度上来的 Cilium Pod 连不上 apiserver。kubespray 集群填 <code>127.0.0.1</code> 最稳：每个节点本地有 nginx 代理转发到所有控制面，天然 HA。</>}
+/>
+
+<Quiz
+  id="cni-2"
+  question="集群扩容后新节点上 Pod 报 failed to allocate IP。正确处理是？"
+  options={[
+    { text: '在 clusterPoolIPv4PodCIDRList 里追加一个新网段，然后重启 cilium-operator', correct: true },
+    { text: '把原有的 /13 改成 /12 扩大范围', feedback: '不能修改已有段 —— 正在运行的 Pod 的 IP 分配和路由都基于它，修改会影响存量业务。只能追加新段。' },
+    { text: '把 clusterPoolIPv4MaskSize 从 24 改成 26，让每节点占用更少 IP', feedback: '能让子网数变多，但同样是修改已有分配规则，且会把每节点的 Pod 密度上限压到 62。' },
+    { text: '删除一些 Pod 释放 IP', feedback: '只是缓解，节点数不变的话总量需求没变，扩容还是会撞上。' },
+  ]}
+  explain={<>Pod CIDR 是「只能追加、不能修改」的。追加之后要重启 cilium-operator 让它感知新段。还有一件容易漏的事：如果集群跑在<strong>原生路由</strong>模式下，新网段必须在底层网络上也能路由（交换机静态路由或 BGP 宣告），否则新段里的 Pod 能拿到 IP 但跨节点不通。隧道模式没这个问题。</>}
+/>
+
+## 这一节的落点
+
+- CNI 是最难改的决定之一，选型看**三点**：要不要 NetworkPolicy、规模与性能、底层能否配合
+- 装之前确认：**路由表冲突（200/202/2004/2005）**、Pod CIDR 与 kubespray 对齐、已知 bug 开关
+- **`k8sServiceHost` 填 `127.0.0.1`**，不要用 `auto`
+- `cilium-dbg status --verbose` 是排障第一站，尤其看 IPAM 用量
+- Pod CIDR **只能追加不能修改**；原生路由模式下新段要底层可路由
+- `hubble observe --verdict DROPPED` 是查策略问题最快的方式
+- **小包通大包不通 → 查 MTU**

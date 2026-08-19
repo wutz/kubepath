@@ -1,0 +1,267 @@
+几十台节点的时候一切正常。几百台之后，某个组件 list 一次 Pod 就能把控制面拖垮。
+
+规模化问题的特点是**非线性**：不是慢一点，而是到某个点突然雪崩。这一节讲那些点在哪。
+
+## 官方规模上限
+
+| 维度 | 上限 |
+| --- | --- |
+| 节点数 | 5000 |
+| Pod 总数 | 150,000 |
+| 容器总数 | 300,000 |
+| 单节点 Pod 数 | **110** |
+
+这些是「官方测过能工作」的边界，不是「到这里才有问题」。实践中在**几百节点**就要开始认真对待。
+
+<Callout type="note" title="真正先撞上的往往不是节点数">
+这张表容易让人误判「我才 200 台，离 5000 还远」。实际先出问题的通常是：
+
+- **对象总数** —— Event、Job、Secret 堆积（见 L2《etcd 运维》）
+- **list/watch 压力** —— 某个组件在疯狂拉全量数据
+- **Service 与 endpoints 数量** —— 影响 kube-proxy 规则同步
+- **etcd 数据库大小** —— 撞上配额直接全集群不可写
+
+节点数只是其中一个维度，而且往往不是最先到的那个。
+</Callout>
+
+## apiserver 的请求链路
+
+理解压力从哪来，先看一个请求怎么被处理：
+
+```
+客户端请求
+  │
+  ├─ 认证 → 授权 → 准入      每一步都有开销，webhook 尤其贵
+  │
+  ├─ 读请求
+  │   ├─ 带 resourceVersion=0 → 从 apiserver 的 watch cache 返回（便宜）
+  │   └─ 不带或要求强一致    → 【穿透到 etcd】（贵）
+  │
+  └─ 写请求 → etcd（必须 fsync，见 L0《etcd 磁盘验收》）
+```
+
+关键是那个分叉：**同样一条 list 请求，走缓存和穿透 etcd 的开销差几个数量级**。
+
+## 昂贵的 list：最常见的元凶
+
+```bash
+# 找出谁在制造 list 请求
+kubectl get --raw /metrics | grep apiserver_request_total | grep LIST
+
+# 用 PromQL 排出 top 10
+topk(10, sum by (resource, verb, client) (
+  rate(apiserver_request_total{verb=~"LIST"}[5m])))
+
+# 看有没有请求在穿透 etcd（这个指标最关键）
+sum by (resource) (rate(apiserver_storage_objects[5m]))
+```
+
+<Callout type="trap" title="一个写得不好的控制器能单独打垮控制面">
+典型的坏模式：某个自研控制器或第三方 Operator 每 10 秒 `list` 一次全集群的 Pod。
+
+在 50 节点集群里，那是几千个对象、几 MB 数据，没人会注意到。到 500 节点、5 万个 Pod 时，同一段代码变成每 10 秒序列化几百 MB —— apiserver 的 CPU 和内存瞬间打满，然后：
+
+```
+apiserver 变慢
+  → 所有组件的 watch 连接超时断开
+    → 它们全部重新 LIST 全量数据
+      → apiserver 压力进一步暴涨
+        → 雪崩
+```
+
+这就是 L1《声明式模型》里提到的 `too old resource version` 引发连锁反应的机制。
+
+**排查方法**：用上面的 PromQL 找出 client 字段异常的调用方。`kubectl` 的 UA 是 `kubectl/v1.31.x`，控制器通常带自己的名字 —— 一眼能看出是谁。
+
+**正确的写法**是用 informer（带本地缓存的 watch），而不是周期性 list。看到一个控制器在周期性 list，那是 bug 而不是设计。
+</Callout>
+
+## API Priority and Fairness
+
+APF 是保护控制面的核心机制：它把请求分到不同的优先级和并发份额里，**保证关键请求不被低优先级的洪水淹掉**。
+
+```bash
+# 看内置的优先级配置
+kubectl get flowschemas
+kubectl get prioritylevelconfigurations
+
+# 看有没有请求被拒绝或长时间排队 —— 这是 APF 正在起作用的信号
+kubectl get --raw /metrics | grep apiserver_flowcontrol_rejected_requests_total
+kubectl get --raw /metrics | grep apiserver_flowcontrol_current_inqueue_requests
+```
+
+内置的几个 FlowSchema 覆盖了大部分情况，值得关注的是它们的相对优先级：
+
+| FlowSchema | 优先级 | 谁在用 |
+| --- | --- | --- |
+| `system-leader-election` | 最高 | 各组件的选主 —— **绝不能被饿死** |
+| `workload-leader-election` | 高 | 业务侧控制器选主 |
+| `system-node-high` | 高 | kubelet 的状态上报 |
+| `kube-system-service-accounts` | 中 | kube-system 里的组件 |
+| `service-accounts` | 中 | 业务侧 ServiceAccount |
+| `global-default` | 低 | 其它 |
+| `catch-all` | 最低 | 兜底 |
+
+给一个已知会发大量请求的组件单独限流：
+
+```yaml
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: FlowSchema
+metadata: { name: limit-noisy-operator }
+spec:
+  priorityLevelConfiguration: { name: global-default }
+  matchingPrecedence: 100        # 数字越小越先匹配
+  distinguisherMethod: { type: ByUser }
+  rules:
+    - subjects:
+        - kind: ServiceAccount
+          serviceAccount: { name: noisy-operator, namespace: default }
+      resourceRules:
+        - verbs: ["list", "get"]
+          apiGroups: [""]
+          resources: ["pods"]
+          clusterScope: true
+          namespaces: ["*"]
+```
+
+<Callout type="warn" title="选主请求被饿死会导致控制面反复切换">
+`system-leader-election` 的优先级最高不是随意设的：如果 controller-manager 或 scheduler 的续租请求被排在洪水后面，它会认为自己失去了领导权，触发重新选主。
+
+后果是控制面组件反复切换 leader —— 每次切换都要重建 informer 缓存、重新 LIST 全量数据，这又进一步加重了 apiserver 的压力。**这是一个正反馈的死亡螺旋**。
+
+所以在 apiserver 压力大时，第一件事是确认 `apiserver_flowcontrol_rejected_requests_total` 里被拒的是低优先级请求，而不是选主类请求。
+</Callout>
+
+## etcd 侧的限制
+
+| 限制 | 值 | 撞上的后果 |
+| --- | --- | --- |
+| 单对象大小 | 默认 1.5MB | 大 ConfigMap / Secret 写不进去 |
+| 数据库大小 | 配额（建议 8GB） | **NOSPACE，全集群不可写** |
+| watch 数量 | 受内存限制 | 内存耗尽 |
+| 单次 range 响应 | 影响大 list 的延迟 | 请求超时 |
+
+```promql
+etcd_mvcc_db_total_size_in_bytes / etcd_server_quota_backend_bytes > 0.7
+```
+
+<Callout type="tip" title="控制对象总数的几条具体措施">
+```yaml
+# 1. Event：量最大的一类。缩短保留时间（apiserver 参数）
+--event-ttl=30m
+
+# 2. Job / Pod：CronJob 必配 TTL
+ttlSecondsAfterFinished: 3600
+successfulJobsHistoryLimit: 3
+
+# 3. 定期审计各类对象数量，找出异常增长的那类
+```
+
+```bash
+etcdctl get / --prefix --keys-only | \
+  sed 's|/registry/\([^/]*\)/.*|\1|' | sort | uniq -c | sort -rn | head -20
+```
+这条命令应该每月跑一次并记录趋势 —— 对象数的异常增长几乎总是在告警响之前几周就有迹象。
+</Callout>
+
+## 调度器与 informer 的压力
+
+大集群里调度器的延迟来自两处：
+
+```bash
+# 调度延迟
+kubectl get --raw /metrics | grep scheduler_scheduling_attempt_duration_seconds
+
+# 待调度队列深度
+kubectl get --raw /metrics | grep scheduler_pending_pods
+```
+
+1. **过滤阶段要遍历节点** —— 节点数上千时，调度器用 `percentageOfNodesToScore` 只评估一部分节点来控制开销
+2. **informer 缓存的内存** —— 调度器要缓存所有 Node、Pod、PV 等对象，几万个 Pod 就是几 GB
+
+```yaml
+# kube-scheduler 配置：大集群里降低这个比例换取调度吞吐
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+percentageOfNodesToScore: 20      # 只给 20% 的可行节点打分
+```
+
+代价是打分池变小，可能选不到全局最优的节点。**吞吐与质量的取舍**，节点多时前者更重要。
+
+## kube-proxy 与 Service 规模
+
+L1《网络模型》讲过这一层，规模化视角下的结论：
+
+| Service 数量 | iptables 模式 | ipvs 模式 | Cilium eBPF |
+| --- | --- | --- | --- |
+| < 500 | 可以 | 可以 | 可以 |
+| 1000–5000 | **规则同步开始变慢** | 良好 | 良好 |
+| > 5000 | **不可用** | 良好 | **最好** |
+
+iptables 模式的问题是**线性匹配 + 全表刷新**：Service 变动频繁时 kube-proxy 的 CPU 打满，规则同步延迟到几十秒 —— 表现是「新 Pod 起来了但流量进不去」。
+
+```bash
+# 规则同步延迟，这个指标涨起来就是信号
+kubectl get --raw /metrics | grep kubeproxy_sync_proxy_rules_duration_seconds
+```
+
+## 什么时候该拆集群
+
+不是「到 5000 节点」，而是出现下面任一情况：
+
+| 信号 | 说明 |
+| --- | --- |
+| **控制面已经加不动了** | 32 核 128G 的 apiserver 仍然吃紧 |
+| **故障域太大** | 一次控制面故障影响的业务范围不可接受 |
+| **升级窗口排不出来** | 集群太大，一次滚动升级要几天 |
+| **多团队变更互相干扰** | 一个团队的 CRD 变更影响另一个团队 |
+| **合规要求物理隔离** | 不同网络域、不同数据等级 |
+
+<Callout type="warn" title="拆集群会把一类问题换成另一类">
+拆完之后，单集群的规模问题没了，但你得到了 L4《多租户》里讲过的那套成本：**升级 ×N、监控 ×N、备份与恢复演练 ×N、配置逐渐漂移**。
+
+而且跨集群的问题是新的：服务如何跨集群发现、流量如何调度、镜像和配置如何一致分发。
+
+所以拆之前先确认单集群的优化都做完了：
+1. **找出并修掉昂贵的 list**（收益最大，成本最低）
+2. 配好 APF
+3. 控制对象总数（Event TTL、Job TTL）
+4. kube-proxy 换 ipvs 或 eBPF
+5. 控制面规格提到位
+
+这几项做完通常能让集群规模再翻一倍。拆集群应该是**架构决策**（故障域、组织边界），而不是性能调优的手段。
+</Callout>
+
+<Quiz
+  id="scale-1"
+  question="集群从 50 台扩到 500 台后 apiserver 频繁过载，控制面组件反复重选 leader。最该先查什么？"
+  options={[
+    { text: '用 apiserver_request_total 找出谁在高频 list 全量对象', correct: true },
+    { text: '直接给 apiserver 加 CPU 和内存', feedback: '可能缓解，但如果根因是某个控制器每 10 秒 list 5 万个 Pod，加机器只是把雪崩点推后一点。' },
+    { text: '拆成多个集群', feedback: '成本极高，而且在没找到根因前拆了，新集群长大后会重现同样的问题。' },
+    { text: '把 kube-proxy 换成 ipvs', feedback: '这解决的是 Service 规模问题（数据面），与 apiserver 的 list 压力（控制面）是两回事。' },
+  ]}
+  explain={<>「50 台正常、500 台雪崩」是典型的 list 放大：同一段代码在对象数增长十倍后开销增长十倍以上。而 leader 反复切换是<strong>死亡螺旋的征兆</strong> —— 选主请求被挤掉 → 组件重选主 → 重建 informer 缓存 → 重新 LIST 全量 → apiserver 压力更大。所以要先定位那个高频 list 的调用方（PromQL 里的 client 字段能看出是谁），修它的收益远大于加硬件。</>}
+/>
+
+<Quiz
+  id="scale-2"
+  question="关于拆分集群，下面哪些说法正确？"
+  options={[
+    { text: '拆之前应该先做完单集群优化：修 list、配 APF、控制对象数、换 ipvs', correct: true },
+    { text: '拆集群会带来升级/监控/备份 ×N 的运维成本和配置漂移', correct: true },
+    { text: '拆集群更适合作为架构决策（故障域、组织边界），而不是性能调优手段', correct: true },
+    { text: '只要节点数接近 5000 就应该拆', feedback: '节点数往往不是最先撞上的限制。对象总数、list 压力、Service 数量通常更早成为瓶颈；反过来，优化到位的集群在几百节点时也可能完全健康。' },
+  ]}
+  explain={<>拆集群是把一类问题换成另一类：单集群的规模压力没了，换来跨集群的服务发现、流量调度、配置一致性问题，以及所有运维动作乘以集群数。所以顺序应该是先榨干单集群的优化空间（这几项通常能让规模再翻一倍），再基于故障域和组织边界的理由去拆 —— 而不是把拆集群当成性能问题的解法。</>}
+/>
+
+## 这一节的落点
+
+- 规模问题是**非线性**的，且先撞上的常常不是节点数
+- **昂贵的 list 是头号元凶**：用 `apiserver_request_total` 的 client 维度找出调用方；周期性 list 是 bug，应该用 informer
+- **选主请求被饿死会引发死亡螺旋** —— 重选主 → 重建缓存 → 重新 LIST → 压力更大
+- 配好 **APF**，给已知吵闹的组件单独限流
+- 控制对象总数：Event TTL、Job TTL、每月审计对象分布趋势
+- Service 多了必须换 **ipvs 或 eBPF**，iptables 在 5000+ 时不可用
+- 拆集群前先做完单集群优化；拆分应基于**故障域与组织边界**，不是性能调优

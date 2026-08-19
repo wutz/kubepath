@@ -1,0 +1,326 @@
+在云上，`type: LoadBalancer` 的 Service 会自动拿到一个外部 IP —— 云厂商的控制器帮你开了一个负载均衡器。
+
+私有集群没有这个东西。那个 `EXTERNAL-IP` 会永远显示 `<pending>`，得你自己把它变出来。
+
+## 私有环境的两层
+
+```
+外部客户端
+   │
+   ▼
+① 四层入口：MetalLB 分配可路由 IP，把流量引到节点
+   │
+   ▼
+② 七层入口：Ingress 控制器（nginx / Envoy）
+   │    按域名、路径分发；处理 TLS
+   ▼
+后端 Service → Pod
+```
+
+**这两层是不同的问题**，混在一起想会很乱：MetalLB 解决「IP 从哪来」，Ingress 解决「一个 IP 怎么服务几十个域名」。
+
+## MetalLB：把 IP 变出来
+
+```bash
+helmwave up --build
+
+kubectl wait -n metallb-system --for=condition=ready pod \
+  -l app.kubernetes.io/instance=metallb --timeout=120s
+```
+
+然后声明地址池：
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.3.200-192.168.3.220     # 必须是没被占用、也不会被 DHCP 分配的地址
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  ipAddressPools: [default-pool]
+  interfaces: [eth0]                   # 承载这个网段的网卡
+```
+
+```bash
+kubectl apply -k .
+
+kubectl get ipaddresspools -n metallb-system
+
+# 看已经用掉了哪些 VIP
+kubectl get svc -A -o jsonpath='{.items[*].status.loadBalancer.ingress[*].ip}' \
+  | tr ' ' '\n' | sort -u
+```
+
+### L2 还是 BGP
+
+| 模式 | 原理 | 适合 | 限制 |
+| --- | --- | --- | --- |
+| **L2** | 一个节点用 ARP 应答 VIP，其它节点不响应 | 简单环境，无需交换机配合 | **所有流量集中到一个节点**，无水平扩展；故障切换靠 ARP 收敛（秒级） |
+| **BGP** | 和交换机建邻居，宣告 VIP 路由 | 生产环境 | 需要网络团队配合分配 AS 号 |
+
+<Callout type="warn" title="L2 模式必须开 kube_proxy_strict_arp">
+这是 L2《把规划写进配置》里提前埋下的一项：
+
+```yaml
+kube_proxy_strict_arp: true
+```
+
+不开的话，kube-proxy 会让所有节点都应答 VIP 的 ARP 请求，与 MetalLB 的「只有一个节点应答」冲突 —— 表现是 LoadBalancer IP **时通时不通**，而且随交换机 ARP 表的刷新而变化。
+
+这个故障非常难查，因为它取决于哪个节点的 ARP 应答先到达交换机。所以哪怕现在还没装 MetalLB，也建议在装集群时就把这一项打开。
+</Callout>
+
+<Callout type="note" title="L2 模式不是负载均衡，是故障转移">
+名字容易误导。L2 模式下，一个 VIP 在任意时刻**只由一个节点承载**，所有流量都经过那个节点再转发到各个 Pod。
+
+它提供的是高可用（节点挂了 VIP 漂走），不是带宽扩展。单节点网卡就是这个服务的吞吐上限。
+
+需要真正的多节点入口就得上 BGP —— 交换机侧做 ECMP，流量分散到多个节点。
+</Callout>
+
+## Ingress：一个 IP 服务多个域名
+
+```bash
+# ingress-nginx，同样用 helmwave 管
+helmwave up --build
+
+kubectl -n ingress-nginx get svc
+# NAME                       TYPE           EXTERNAL-IP       PORT(S)
+# ingress-nginx-controller   LoadBalancer   192.168.3.200     80:31234/TCP,443:31235/TCP
+#                                           ↑ MetalLB 分配的
+```
+
+这里体现了两层的配合：**整个集群只需要一个 LoadBalancer IP**，给 Ingress 控制器用；后面几十个域名都通过它进来。
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [web.k8s1.zw1.paratera.com]
+      secretName: web-tls
+  rules:
+    - host: web.k8s1.zw1.paratera.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port: { number: 80 }
+```
+
+几个常用注解，都是实际会撞上的：
+
+| 注解 | 解决什么 |
+| --- | --- |
+| `proxy-body-size` | 默认 1MB，上传大文件会 **413** |
+| `proxy-read-timeout` | 默认 60 秒，长连接/流式响应会被切断 |
+| `ssl-redirect` | 强制 HTTPS |
+| `backend-protocol: HTTPS` | 后端本身是 HTTPS 时必须配 |
+
+<Callout type="trap" title="上传失败报 413，先想到 proxy-body-size">
+ingress-nginx 默认限制请求体 1MB。业务侧看到的是上传大文件失败，日志里是 `413 Request Entity Too Large`。
+
+很多人会去查应用配置、查网络，而实际上是 Ingress 这一层拦的。同类的还有 `proxy-read-timeout`：SSE、长轮询、大模型的流式输出都会被默认的 60 秒切断，表现为「响应到一半断了」。
+
+这两个默认值几乎每个集群都要改，可以直接配在 controller 的全局 ConfigMap 里，不用每个 Ingress 都写注解。
+</Callout>
+
+## cert-manager：证书自动签发
+
+```bash
+helmwave up --build
+```
+
+```yaml
+# 内网自签 CA
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: { name: internal-ca }
+spec:
+  ca:
+    secretName: internal-ca-key-pair
+---
+# 或者 Let's Encrypt（需要公网可达做验证）
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: { name: letsencrypt }
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops@example.com
+    privateKeySecretRef: { name: letsencrypt-account-key }
+    solvers:
+      - dns01:                     # 内网服务只能用 DNS-01，HTTP-01 需要公网可达
+          cloudflare:
+            apiTokenSecretRef: { name: cloudflare-token, key: token }
+```
+
+配好之后，Ingress 上加一个注解就自动签发和续期：
+
+```yaml
+metadata:
+  annotations:
+    cert-manager.io/cluster-issuer: internal-ca
+spec:
+  tls:
+    - hosts: [web.k8s1.zw1.paratera.com]
+      secretName: web-tls          # cert-manager 会自动创建这个 Secret
+```
+
+```bash
+# 排查签发问题：顺着这条链往下看
+kubectl get certificate,certificaterequest,order,challenge -A
+kubectl describe certificate web-tls
+```
+
+<Callout type="tip" title="签发失败按对象链逐层看">
+cert-manager 的对象是一条链：`Certificate → CertificateRequest → Order → Challenge`。
+
+失败时**从后往前看**：`Challenge` 的 status 里通常直接写着为什么验证不通过（DNS 记录没生效、HTTP-01 的路径不可达、API token 权限不足）。
+
+这又是 L1《声明式模型》讲的那个套路 —— 看对象的 `status.conditions`，不用为 cert-manager 学一套新的排障方法。
+</Callout>
+
+## Gateway API：新一代标准
+
+Ingress 的核心问题是**所有关注点混在一个对象里**：谁提供入口、TLS 证书谁管、路由规则谁写，全在一个 YAML 里，多团队协作时权限没法切分。
+
+Gateway API 把它拆成三层：
+
+```
+GatewayClass   基础设施提供方定义（一次性）
+   ↑
+Gateway        平台团队管：监听端口、TLS、允许哪些命名空间接入
+   ↑
+HTTPRoute      业务团队管：自己的域名和路径规则
+```
+
+```yaml
+# 平台团队
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: main, namespace: gateway-system }
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      tls:
+        certificateRefs: [{ name: wildcard-tls }]
+      allowedRoutes:
+        namespaces: { from: Selector, selector: { matchLabels: { gateway-access: "true" } } }
+---
+# 业务团队，在自己的命名空间里
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web, namespace: team-a }
+spec:
+  parentRefs: [{ name: main, namespace: gateway-system }]
+  hostnames: [web.k8s1.zw1.paratera.com]
+  rules:
+    - matches: [{ path: { type: PathPrefix, value: / } }]
+      backendRefs:
+        - name: web
+          port: 80
+          weight: 90        # 原生支持流量切分，不需要注解
+        - name: web-canary
+          port: 80
+          weight: 10
+```
+
+| | Ingress | Gateway API |
+| --- | --- | --- |
+| 灰度发布 | 靠控制器专有注解 | **原生 `weight`** |
+| header / method 匹配 | 靠注解，各控制器不通用 | 原生 |
+| 角色分离 | 无 | **有**，权限可按对象切分 |
+| 生态成熟度 | 最广 | 逐步铺开 |
+
+**新项目建议直接上 Gateway API**，尤其是多团队共用一个入口的平台。已有大量 Ingress 的集群可以并存，逐步迁移。
+
+## 排查「服务访问不到」
+
+从外到内逐层排除：
+
+```bash
+# 1. LoadBalancer 拿到 IP 了吗 —— pending 说明 MetalLB 没工作或地址池耗尽
+kubectl get svc -A | grep LoadBalancer
+
+# 2. 从集群外能 ping 到这个 VIP 吗 —— 不通就是 MetalLB/ARP/BGP 层的问题
+ping 192.168.3.200
+
+# 3. Ingress 控制器自己健康吗
+kubectl -n ingress-nginx logs deploy/ingress-nginx-controller --tail=50
+
+# 4. Ingress 对象被正确识别了吗
+kubectl describe ingress web        # 看 Address 字段有没有被填上
+
+# 5. 后端 Service 有 endpoints 吗（最常见的原因）
+kubectl get endpointslices -l kubernetes.io/service-name=web
+
+# 6. 绕过 Ingress 直接测后端，区分是入口问题还是应用问题
+kubectl port-forward svc/web 8080:80
+curl localhost:8080
+```
+
+<Callout type="tip" title="第 6 步能把问题一刀切成两半">
+`port-forward` 绕过了 MetalLB、Ingress、Service 的全部转发链路，直连 Pod。
+
+- 这样能通 → 问题在入口链路（MetalLB / Ingress / Service）
+- 这样也不通 → 问题在应用本身
+
+先做这一步，能省掉一半的排查方向。
+</Callout>
+
+<Quiz
+  id="ing-1"
+  question="LoadBalancer 类型的 Service 拿到了 IP，但从集群外访问时时通时不通。最可能的原因？"
+  options={[
+    { text: 'kube_proxy_strict_arp 没开，多个节点都在应答 VIP 的 ARP', correct: true },
+    { text: 'MetalLB 地址池配小了', feedback: '地址池不足会导致 Service 拿不到 IP（EXTERNAL-IP 一直 pending），不会表现为拿到了却时通时不通。' },
+    { text: 'Ingress 控制器副本数不够', feedback: '副本不足会表现为负载高或部分请求慢，不会随时间呈现「时通时不通」的规律。' },
+    { text: 'Pod 的 readinessProbe 配错了', feedback: '那会导致 endpoints 为空、一直不通，而不是间歇性。' },
+  ]}
+  explain={<>「时通时不通」+「取决于交换机 ARP 表状态」是 <code>strict_arp</code> 没开的典型症状。MetalLB 的 L2 模式依赖「只有一个节点应答 VIP 的 ARP」，而 kube-proxy 默认会让所有节点都应答 —— 两者冲突，实际生效的取决于哪个应答先到交换机。这也是为什么这一项建议在装集群时就打开，而不是等装 MetalLB 时才想起来。</>}
+/>
+
+<Quiz
+  id="ing-2"
+  question="关于 MetalLB 的 L2 模式，下面哪些说法正确？"
+  options={[
+    { text: '一个 VIP 在任意时刻只由一个节点承载', correct: true },
+    { text: '它提供的是故障转移，不是带宽扩展', correct: true },
+    { text: '需要多节点同时承载流量就得用 BGP 模式', correct: true },
+    { text: 'L2 模式下流量会自动均摊到所有节点', feedback: '恰恰相反 —— 所有流量都经过承载 VIP 的那一个节点，那个节点的网卡就是吞吐上限。' },
+  ]}
+  explain={<>L2 模式的实现是「选一个节点应答 ARP」，所以它本质上是 VIP 漂移（高可用），不是负载分担。这个限制在流量不大时无所谓，但要做高吞吐入口就必须上 BGP —— 交换机侧配 ECMP，把同一个 VIP 的流量分散到多个节点。</>}
+/>
+
+## 这一节的落点
+
+- 私有环境分**两层**：MetalLB 解决 IP 从哪来，Ingress 解决一个 IP 服务多域名
+- **L2 模式必须开 `kube_proxy_strict_arp`**，否则时通时不通
+- L2 是故障转移不是负载均衡；要多节点入口用 BGP
+- 整个集群通常只需要**一个** LoadBalancer IP，给 Ingress 用
+- `proxy-body-size`（413）和 `proxy-read-timeout`（流式响应被切）几乎每个集群都要改
+- cert-manager 排障顺着 `Certificate → CertificateRequest → Order → Challenge` 从后往前看
+- 新项目上 Gateway API，它的角色分离对多团队平台价值很大
+- 排障先做 `port-forward`，一刀把入口问题和应用问题分开

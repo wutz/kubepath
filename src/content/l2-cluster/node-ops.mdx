@@ -1,0 +1,223 @@
+一次夜间维护是平稳还是事故，通常取决于 `cordon`、`drain`、`delete` 这三步之间的差别有没有搞清楚。
+
+## 三个动作，三种语义
+
+| 动作 | 做了什么 | 已有 Pod |
+| --- | --- | --- |
+| `cordon` | 给节点打 `unschedulable` 标记 | **不动** |
+| `drain` | cordon + 驱逐所有可驱逐的 Pod | **迁走** |
+| `delete node` | 从集群里删掉 Node 对象 | 对象没了，**容器可能还在节点上跑** |
+
+<Callout type="trap" title="delete node 不会停掉节点上的容器">
+这是个危险的误解。`kubectl delete node` 只删除 apiserver 里的 Node 对象 —— 那台机器上的 kubelet 和容器**照旧运行**。
+
+后果是：控制器认为这些 Pod 已经消失，在别的节点重建了一份；而原节点上的旧副本还在跑，还可能持有存储的写锁、还在往数据库写数据。**这就是脑裂。**
+
+正确顺序永远是：`drain` 把工作负载迁走 → 确认节点上没有业务 Pod → 停 kubelet → 再 `delete node`。
+</Callout>
+
+## 标准的维护流程
+
+```bash
+# 1. 先摘调度，观察一段时间（新 Pod 不再进来，存量不动）
+kubectl cordon cn-192-168-3-50
+
+# 2. 看清这台节点上都有谁，评估影响面
+kubectl get pod -A -o wide --field-selector spec.nodeName=cn-192-168-3-50
+
+# 3. 驱逐
+kubectl drain cn-192-168-3-50 \
+  --ignore-daemonsets \          # DaemonSet 不驱逐，控制器会立刻重建
+  --delete-emptydir-data \       # 承认 emptyDir 数据会丢
+  --timeout=600s \
+  --grace-period=60              # 给应用足够的优雅终止时间
+
+# 4. 确认干净了（只剩 DaemonSet）
+kubectl get pod -A -o wide --field-selector spec.nodeName=cn-192-168-3-50
+
+# 5. 做维护……
+
+# 6. 放回调度
+kubectl uncordon cn-192-168-3-50
+```
+
+<Callout type="tip" title="cordon 和 drain 之间留一段观察时间">
+`cordon` 之后先不急着 `drain`。这段时间里：
+
+- 新 Pod 不会再调度上来，节点开始「自然排空」
+- 你有机会看清这台节点上有哪些有状态负载、哪些 Pod 没有多副本
+- 如果发现某个单副本服务在上面，可以先扩容再驱逐，避免中断
+
+赶时间时 `cordon` 和 `drain` 连着敲没问题，但**批量维护多台时，先把所有要维护的节点一起 cordon**，然后逐台 drain —— 这样避免 Pod 从一台待维护节点被赶到另一台待维护节点上，来回搬两次。
+</Callout>
+
+## drain 卡住的三类原因
+
+`drain` 一直不返回，几乎总是这三种之一：
+
+### 1. PodDisruptionBudget 拦着
+
+```bash
+kubectl get pdb -A
+# NAME   MIN AVAILABLE   ALLOWED DISRUPTIONS   AGE
+# web    3               0                     30d
+#                        ↑ 这个 0 就是原因
+```
+
+`ALLOWED DISRUPTIONS: 0` 意味着现在驱逐任何一个副本都会违反约束。常见成因：
+
+- `minAvailable` 配成了等于副本数 —— **这会永久卡住 drain**
+- 已经有副本不健康，剩下的刚好等于 `minAvailable`
+
+```bash
+# 处理：先把不健康的副本修好，或临时扩容
+kubectl scale deploy web --replicas=5
+```
+
+### 2. 裸 Pod（没有控制器管的 Pod）
+
+`drain` 默认拒绝驱逐没有 ownerReferences 的 Pod —— 因为删了就没了，不会有人重建。
+
+```bash
+# 找出裸 Pod
+kubectl get pod -o custom-columns=\
+'NAME:.metadata.name,OWNER:.metadata.ownerReferences[0].kind' \
+  --field-selector spec.nodeName=cn-192-168-3-50 | grep '<none>'
+```
+
+确认这些 Pod 可以丢，才加 `--force`。**`--force` 会直接删掉它们，数据不保留。**
+
+### 3. 本地存储
+
+```
+error: cannot delete Pods with local storage (use --delete-emptydir-data to override)
+```
+
+`emptyDir` 里的数据是节点本地的，Pod 迁走就丢。加 `--delete-emptydir-data` 是在明确承认这一点。
+
+用了 `local-path-provisioner` 或 hostPath PV 的 Pod 更麻烦：它们的数据绑在这台节点上，迁到别处等于换了一份空数据。这类负载在维护前需要单独处理（备份、或者接受重建）。
+
+<Callout type="warn" title="CSI node plugin 也是 DaemonSet，注意顺序">
+`--ignore-daemonsets` 会跳过 DaemonSet，这是对的。但要注意 **CSI node plugin 也是 DaemonSet** —— 它负责卸载卷。
+
+如果因为某种原因 CSI 的 DaemonSet Pod 先被干掉了（比如手工删了、或者节点上 CNI/CSI 出了问题），那么要迁走的有状态 Pod 就**卸载不了卷**，会卡在 `Terminating`，而新节点上的副本因为卷还被旧节点持有而起不来。
+
+现象是 drain 卡住 + 新 Pod 卡在 `ContainerCreating` 报 `Multi-Attach error`。处理时先确认 CSI node plugin 在这台节点上还是 Running。
+</Callout>
+
+## 节点异常时的强制处理
+
+节点已经物理宕机，`drain` 连不上它，Pod 卡在 `Terminating`：
+
+```bash
+# 节点确认已死（不是网络分区！）之后
+kubectl delete node cn-192-168-3-50
+
+# 删除 Node 对象会让上面的 Pod 被强制清理，控制器在别处重建
+```
+
+<Callout type="trap" title="区分「节点死了」和「网络分区」">
+两者在集群看来完全一样：节点 NotReady、心跳停止。但处理方式相反。
+
+- **节点真的死了**（断电、硬件故障）→ 删 Node 对象，让 Pod 在别处重建是安全的
+- **只是网络分区**（交换机问题、网卡故障）→ 节点上的容器**还在运行**，还在读写存储。此时删 Node 让 Pod 在别处重建，就是双写
+
+判断方法：带外管理（IPMI/BMC）看机器是否真的关了，或者从另一条网络路径尝试连接。**在有状态服务上，这个确认步骤不能省。**
+
+带 fencing 能力的存储（Ceph RBD 的 exclusive-lock、GPFS 的节点驱逐）能提供一层保护 —— 旧节点被隔离后无法继续写入。没有这层保护的话，只能靠人工确认。
+</Callout>
+
+## 扩容节点
+
+用 kubespray：
+
+```bash
+# 1. 新节点加进 inventory 的 [kube_node]
+# 2. 刷新 facts
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root playbooks/facts.yml
+# 3. 只对新节点跑 scale.yml
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root \
+  scale.yml --limit=cn-192-168-3-52
+```
+
+新节点加进来后要确认它**真的参与了调度**，而不只是 Ready：
+
+```bash
+kubectl get node cn-192-168-3-52 -o wide
+
+# 1. 有没有意外的污点
+kubectl describe node cn-192-168-3-52 | grep -A5 Taints
+
+# 2. 标签齐不齐 —— 拓扑标签、GPU 标签漏了会导致它拿不到对应的负载
+kubectl get node cn-192-168-3-52 --show-labels
+
+# 3. DaemonSet 都到位了吗（CNI、CSI、监控 agent）
+kubectl get pod -A -o wide --field-selector spec.nodeName=cn-192-168-3-52
+
+# 4. 真的调度上去一个测试 Pod
+kubectl run probe --image=busybox --overrides='{"spec":{"nodeName":"cn-192-168-3-52"}}' \
+  --restart=Never -- sleep 30
+```
+
+<Callout type="warn" title="新节点最容易漏的是标签">
+L0《硬件与拓扑》讲过：`topologySpreadConstraints` 依赖 `topology.kubernetes.io/zone` 标签。
+
+新节点忘了打机架标签，它就不参与拓扑分布计算 —— 结果是副本可能全被摊到这台「无标签」节点上，或者反过来永远调不上去（`DoNotSchedule` 时）。
+
+**扩容的检查清单里必须包含标签核对**，最好把打标签写进扩容脚本，而不是靠人记得。
+</Callout>
+
+## 批量维护的节奏
+
+几十台节点要逐台重启（内核升级、固件更新）时：
+
+```bash
+# 一次只动一台，每台之间留出恢复时间
+for node in $(kubectl get node -l role=worker -o name); do
+  kubectl drain ${node#node/} --ignore-daemonsets --delete-emptydir-data --timeout=600s
+  # 维护操作……
+  kubectl uncordon ${node#node/}
+  # 等 Pod 重新调度并就绪，再动下一台
+  sleep 120
+  kubectl wait --for=condition=Ready pod -l app=web --timeout=300s -A
+done
+```
+
+三条经验：
+
+1. **一次只动一台**，除非集群很大且 PDB 配置可靠
+2. **每台之后等 Pod 就绪**，不要看着 node Ready 就往下走 —— Pod 重新调度和拉镜像需要时间
+3. **有 PDB 的服务让 PDB 说话** —— drain 卡住是保护机制在起作用，别急着加 `--force`
+
+<Quiz
+  id="node-1"
+  question="drain 一个节点时报 ALLOWED DISRUPTIONS: 0，命令一直卡着。合理的处理是？"
+  options={[
+    { text: '先查是否有副本不健康，把它修好；或临时扩容让可用副本数超过 minAvailable', correct: true },
+    { text: '加 --force 强制驱逐', feedback: '--force 是用来处理裸 Pod 的，而且绕过 PDB 就等于放弃了这层保护 —— PDB 正在阻止一次会导致服务容量不足的操作。' },
+    { text: '删掉这个 PDB', feedback: '能让 drain 通过，但代价是这次维护可能真的把服务打到容量不足。PDB 拦住你是在做它该做的事。' },
+    { text: '直接 delete node', feedback: '更糟 —— 节点上的容器还在跑，会造成脑裂。' },
+  ]}
+  explain={<><code>ALLOWED DISRUPTIONS: 0</code> 是 PDB 在说「现在再少一个副本就不够了」。正确反应是先满足条件再驱逐：修好不健康的副本，或者临时扩容。另外要检查 PDB 本身是否配错 —— <code>minAvailable</code> 等于副本数会让 drain <strong>永久</strong>卡住，那是配置 bug 而不是保护。</>}
+/>
+
+<Quiz
+  id="node-2"
+  question="一个节点 NotReady 已经 10 分钟，上面有个 MySQL 的 StatefulSet Pod 卡在 Terminating。这时候该做什么？"
+  options={[
+    { text: '先通过带外管理确认机器是真的宕机还是只是网络不通，再决定是否删 Node 对象', correct: true },
+    { text: '立刻 delete node，让 Pod 在别的节点重建', feedback: '如果只是网络分区，那台节点上的 MySQL 还在运行、还在写数据 —— 新起一个副本就是双写，数据会损坏。' },
+    { text: '强制删除 Pod（--force --grace-period=0）', feedback: '同样的问题：强删只是让 apiserver 里的对象消失，原节点上的进程还在。有状态服务上这一步风险很高。' },
+    { text: '等 kubelet 自己恢复', feedback: '等待本身没错，但不能只等 —— 必须主动确认机器的真实状态，否则无法判断该等还是该处理。' },
+  ]}
+  explain={<>集群看到的 NotReady 无法区分「机器死了」和「网络断了」，但这两种情况的正确处理是相反的。对无状态服务，赌错的代价是多跑一份副本；对有状态服务，赌错的代价是数据损坏。所以必须走带外管理（IPMI/BMC）确认电源状态，或者从另一条网络路径验证。有 fencing 能力的存储（RBD exclusive-lock、GPFS 驱逐）能提供一层兜底，但不能替代确认。</>}
+/>
+
+## 这一节的落点
+
+- **`delete node` 不停容器** —— 顺序永远是 drain → 确认 → 停 kubelet → delete
+- cordon 与 drain 之间留观察时间；批量维护时先全部 cordon 再逐台 drain
+- drain 卡住的三类原因：**PDB、裸 Pod、本地存储**，各有对应处理，不要一律 `--force`
+- CSI node plugin 是 DaemonSet，它先没了会导致卷卸载不掉
+- **NotReady ≠ 宕机**，有状态服务上必须带外确认，否则可能双写
+- 扩容后核对：污点、**标签**、DaemonSet 到位、真的调度得上

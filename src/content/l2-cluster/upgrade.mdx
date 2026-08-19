@@ -1,0 +1,232 @@
+升级本身不难，难的是升到一半发现回不去。
+
+所以这一节的顺序是反的：先想清楚回滚路径，再谈怎么升。
+
+## 版本偏差策略
+
+K8s 允许各组件版本不完全一致，但有严格的约束：
+
+```
+kube-apiserver              n            ← 必须最先升，且是最高版本
+kube-controller-manager     n-1 ~ n
+kube-scheduler              n-1 ~ n
+kubelet                     n-3 ~ n      ← 可以落后三个小版本
+kube-proxy                  与 kubelet 一致
+kubectl                     n-1 ~ n+1
+```
+
+两条推论：
+
+1. **升级顺序固定**：apiserver → 其它控制面组件 → kubelet。反过来做会导致 kubelet 版本高于 apiserver，不受支持
+2. **不能跳小版本**：1.28 → 1.30 必须经过 1.29。想跳只能靠连续升两次
+
+<Callout type="warn" title="跳版本升级不只是「不推荐」，是真的会坏">
+每个小版本的升级过程里可能包含数据格式迁移、API 版本转换、CRD 存储版本变更。跳过中间版本，这些迁移步骤就没执行。
+
+后果可能在很久之后才暴露：某个对象读不出来、某个控制器行为异常、etcd 里存着谁也不认识的格式。而这时候已经没有回头路了。
+
+所以 1.28 → 1.31 的正确做法是升三次，每次之间验证一轮。听起来慢，但比修一个跨版本迁移的烂摊子快得多。
+</Callout>
+
+## 升级前的检查
+
+### 1. API 弃用项
+
+这是最容易翻车的地方 —— 业务清单里用了被移除的 API 版本，升级后那些资源直接消失。
+
+```bash
+# 官方文档的弃用 API 迁移指南必读
+# https://kubernetes.io/docs/reference/using-api/deprecation-guide/
+
+# 用 pluto 扫描集群里和仓库里的清单
+pluto detect-all-in-cluster -t k8s=v1.31.0
+pluto detect-files -d ./manifests -t k8s=v1.31.0
+
+# 也可以直接查 apiserver 的弃用告警指标
+kubectl get --raw /metrics | grep apiserver_requested_deprecated_apis
+```
+
+最后那条指标很实用：它告诉你**集群里实际上还有谁在调用弃用的 API**，比扫描静态文件更准 —— 因为有些调用来自第三方 Operator，不在你的仓库里。
+
+### 2. 组件兼容性
+
+```bash
+# 列出所有 CRD 和它们的来源，逐个查目标版本的兼容性
+kubectl get crd -o custom-columns='NAME:.metadata.name,GROUP:.spec.group'
+
+# 重点关注这几类，它们和 K8s 版本耦合最紧：
+#   CNI（Cilium）、CSI 驱动、GPU Operator、Ingress 控制器、监控栈
+```
+
+<Callout type="trap" title="CNI 和 CSI 的兼容性要单独确认">
+它们直接和 kubelet、containerd 交互，对版本最敏感。
+
+典型事故：升级 K8s 后 Cilium 版本不支持新的 kubelet，节点上所有 Pod 的网络起不来 —— 而这时候集群已经升上去了。
+
+正确做法是**先升 CNI/CSI 到同时支持新旧 K8s 版本的中间版本，再升 K8s**。这样任何一步出问题都还有退路。查兼容性矩阵，不要凭「应该没问题」。
+</Callout>
+
+### 3. 先在测试集群走一遍
+
+用同样的 kubespray 版本、同样的 group_vars、尽量接近的节点数。这一步没有替代方案 —— 生产集群的第一次升级不应该是第一次执行这套流程。
+
+## 回滚边界：哪些能回，哪些不能
+
+这是升级计划里最该先想清楚的事：
+
+| 阶段 | 能回滚吗 | 怎么回 |
+| --- | --- | --- |
+| 只升了 kubelet（部分节点） | ✅ 能 | 降级 kubelet 二进制，重启 |
+| 升了控制面组件，未做 etcd 迁移 | ⚠️ 勉强 | 换回旧版本镜像 |
+| **etcd 数据格式已迁移** | ❌ **不能** | 只能从快照恢复 |
+| **API 对象已按新版本重写** | ❌ **不能** | 同上 |
+
+<Callout type="warn" title="etcd 是一道单向门">
+一旦控制面升级触发了 etcd 的数据格式变更或对象存储版本迁移，**降级 apiserver 是不安全的** —— 旧版本可能读不了新格式，或者读出来的语义不对。
+
+这意味着真正的回滚手段只有一个：**从升级前的 etcd 快照恢复**。而这必然伴随数据丢失（快照之后的所有变更）和一段停机。
+
+所以升级计划里必须明确写出：
+- 快照是什么时候打的、存在哪、验证过能恢复吗
+- 从哪一步开始就没有真正的回滚了
+- 那之后的策略是「向前修复」，需要准备什么
+
+「回滚方案：出问题就升回去」不是方案。
+</Callout>
+
+## 执行升级
+
+```bash
+# 1. 备份，并验证快照可用
+etcdctl snapshot save /root/etcd-preupgrade-$(date +%F).db
+etcdctl snapshot status /root/etcd-preupgrade-$(date +%F).db -w table
+
+# 2. 改 kubespray 的目标版本
+vim inventory/mycluster/group_vars/k8s_cluster/k8s-cluster.yml
+# kube_version: v1.31.4
+
+# 3. 先只升控制面，验证一轮
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root \
+  upgrade-cluster.yml --limit=kube_control_plane
+
+# 4. 验证控制面
+kubectl get node
+kubectl -n kube-system get pod
+kubectl version
+
+# 5. 分批升工作节点
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root \
+  upgrade-cluster.yml --limit=cn-192-168-3-50,cn-192-168-3-51
+```
+
+<Callout type="tip" title="upgrade-cluster.yml 自己会 drain，但节奏要你控制">
+`upgrade-cluster.yml` 对每个节点做的是：cordon → drain → 升级组件 → uncordon。它默认串行处理节点。
+
+关键是用 `--limit` 分批，而不是一次跑完所有节点：
+
+- 每批之间可以验证业务是否正常，有问题就停下来
+- 出问题时受影响的节点数是可控的
+- 长时间运行的 playbook 中途断了，恢复现场更简单
+
+批次大小建议：第一批 1 台（验证流程），之后每批 3–5 台。
+
+另外 `upgrade_node_confirm: true` 可以让 playbook 在每个节点前暂停确认，第一次做升级时值得开。
+</Callout>
+
+## 业务侧的配合
+
+升级会逐台 drain 节点，所以业务必须能承受 Pod 迁移。三件事要提前确认（都在 L1 讲过）：
+
+```yaml
+# 1. PDB 保证驱逐不会一次带走太多副本
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+spec:
+  minAvailable: 2         # 不要等于副本数，否则 drain 永久卡住
+  selector:
+    matchLabels: { app: web }
+```
+
+```yaml
+# 2. 优雅终止：preStop + 足够的 grace period
+lifecycle:
+  preStop:
+    exec: { command: ["sh", "-c", "sleep 5"] }
+terminationGracePeriodSeconds: 60
+
+# 3. 拓扑分布：确保副本不会都挤在同一批待升级的节点上
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels: { app: web }
+```
+
+<Callout type="warn" title="升级前先把所有 PDB 检查一遍">
+```bash
+kubectl get pdb -A
+```
+两种配置会让升级卡死在半路：
+
+- `minAvailable` 等于副本数 → `ALLOWED DISRUPTIONS: 0`，drain 永远等待
+- 已有副本不健康 → 剩余可用数刚好等于 `minAvailable`，同样卡住
+
+在升级窗口里卡住，比升级前发现要难受得多 —— 你在半升级状态下要么强推（放弃保护）要么回退（前面说过回退很贵）。**升级前扫一遍 PDB，是最便宜的一次检查。**
+</Callout>
+
+## 升级后验证
+
+```bash
+# 1. 版本一致性
+kubectl get node -o custom-columns='NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion'
+
+# 2. 控制面全部 Running，无 CrashLoop
+kubectl -n kube-system get pod
+
+# 3. 核心链路：DNS、Service、存储、网络
+kubectl run -it --rm t --image=busybox:1.36 -- nslookup kubernetes.default
+kubectl get pvc -A                    # 没有新出现的 Pending
+kubectl get pod -A | grep -v Running | grep -v Completed
+
+# 4. 弃用 API 的调用是否消失
+kubectl get --raw /metrics | grep apiserver_requested_deprecated_apis
+
+# 5. 证书有效期（升级会重签，确认新的到期时间）
+kubeadm certs check-expiration
+
+# 6. 业务侧的核心指标：错误率、延迟
+```
+
+<Quiz
+  id="upg-1"
+  question="计划把集群从 1.28 升到 1.31。以下哪个方案是对的？"
+  options={[
+    { text: '连续升三次：1.28→1.29→1.30→1.31，每次之间完整验证一轮', correct: true },
+    { text: '直接升到 1.31，一步到位省时间', feedback: '跳小版本会跳过中间版本的数据迁移与 API 转换步骤，问题可能在很久之后才暴露，而那时已经无法回滚。' },
+    { text: '先把所有 kubelet 升到 1.31，再升控制面', feedback: '顺序反了。kubelet 版本不能高于 apiserver，这不受支持。必须 apiserver 先升。' },
+    { text: '新建一套 1.31 集群，把 etcd 数据直接拷过去', feedback: 'etcd 数据里的对象需要经过版本迁移，直接拷贝跨三个版本的数据风险极高。业务迁移是可行方案，但那是重建而不是升级。' },
+  ]}
+  explain={<>版本偏差策略允许 kubelet 落后 apiserver 三个小版本，但<strong>不允许跳版本升级</strong> —— 每个小版本可能包含必须执行的迁移逻辑。所以只能一版一版走，每次之间验证一轮。另一个可行思路是「蓝绿集群」：建新集群、把业务逐步迁过去、验证后下线老集群 —— 代价是双份资源，收益是回滚只需要把流量切回去。</>}
+/>
+
+<Quiz
+  id="upg-2"
+  question="关于升级的回滚，下面哪些说法正确？"
+  options={[
+    { text: 'etcd 数据格式一旦迁移，降级 apiserver 是不安全的', correct: true },
+    { text: '真正的回滚手段是从升级前的 etcd 快照恢复，会有数据丢失和停机', correct: true },
+    { text: '升级计划里必须写明从哪一步之后就没有真正的回滚了', correct: true },
+    { text: '出问题就把版本号改回去重跑 playbook 即可', feedback: '这只在还没触及 etcd 数据格式的早期阶段可能有效。控制面升级完成后，降级 apiserver 可能读不了新格式的数据。' },
+  ]}
+  explain={<>「回滚方案：升回去」是升级计划里最常见的空话。实际的边界是：只升了 kubelet 还能降回来；控制面升完、数据格式迁移之后就是单向门，只能从快照恢复或向前修复。把这条边界在计划里写清楚，团队才知道在哪一步之前必须做完验证、在哪一步之后只能往前走。</>}
+/>
+
+## 这一节的落点
+
+- 顺序固定：**apiserver → 其它控制面 → kubelet**；不能跳小版本
+- 升级前必查：**弃用 API**（用 `apiserver_requested_deprecated_apis` 指标看实际调用）、CNI/CSI 兼容性、测试集群预演
+- **etcd 是单向门** —— 数据格式迁移后只能从快照恢复。回滚边界要写进计划
+- 用 `--limit` 分批：第一批 1 台，之后 3–5 台
+- 升级前扫一遍 PDB，避免在窗口里卡死
+- 升级后验证到业务指标，不要停在「Pod 都 Running」

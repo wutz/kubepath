@@ -1,0 +1,233 @@
+3 台变 5 台、换掉一台坏掉的管理节点、证书还有 30 天到期 —— 这三件事的共同点是**不能试错**：做错一步可能丢掉 etcd quorum，整个集群立刻不可写。
+
+所以这一节的重点不是命令，是顺序和前置条件。
+
+## 先理解 quorum
+
+etcd 用 Raft，写入需要**多数成员**确认：
+
+| 成员数 | quorum | 可容忍故障 |
+| --- | --- | --- |
+| 1 | 1 | 0 |
+| 2 | 2 | **0**，绝不要停在这个状态 |
+| 3 | 2 | 1 |
+| 4 | 3 | 1，白付代价 |
+| 5 | 3 | 2 |
+
+<Callout type="trap" title="偶数成员是最危险的中间状态">
+2 成员的 etcd 比 1 成员**更差**：quorum 是 2，任何一个挂掉就完全不可写；而 1 成员集群只要它自己活着就能工作。
+
+4 成员同样：quorum 3，容错仍然只有 1，和 3 成员一个水平，但多养一台机器还增加了写延迟。
+
+所以成员变更要**尽快通过偶数状态**。3→5 的过程中必然经过 4 成员，这个窗口越短越好 —— 这也是要一台一台加、而不是同时加两台的原因。
+</Callout>
+
+## 操作前的三件事
+
+任何控制面变更之前，无例外：
+
+```bash
+# 1. etcd 快照备份，并确认文件真的存在且大小合理
+set -a && source /etc/etcd.env && set +a
+etcdctl snapshot save /root/etcd-$(date +%F-%H%M).db
+ls -lh /root/etcd-*.db
+
+# 2. 确认当前 etcd 集群是健康的 —— 不健康时不要做变更
+etcdctl endpoint status --write-out=table --cluster
+etcdctl endpoint health --cluster
+etcdctl member list -w table
+
+# 3. 备份 inventory 与 kubeconfig
+cp -r inventory/mycluster inventory/mycluster.bak-$(date +%F)
+```
+
+<Callout type="warn" title="在 etcd 已经不健康的时候做扩容，是把小问题变成大问题">
+如果 `endpoint health` 显示某个成员不健康，先修它。在 3 成员里已经坏了 1 个（quorum 刚好满足）的情况下去加新成员，会让 quorum 变成 3 —— 而你只有 2 个健康成员，**集群立刻变成不可写**。
+
+顺序永远是：先恢复到全健康，再做变更。
+</Callout>
+
+## 扩控制面：用 recover-control-plane.yml
+
+这是最容易踩错的地方：**扩控制面不能用 `scale.yml`**。
+
+`scale.yml` 是给工作节点设计的，它不会正确处理 etcd 成员变更 —— 结果可能是新节点上的 etcd 配置不对、或者 etcd 集群成员列表与实际不一致。
+
+kubespray 的正确做法有点反直觉：**把新节点当成「坏掉待恢复」的节点**，用 `recover-control-plane.yml` 触发恢复逻辑，从而安全地加入 etcd 成员。
+
+```ini
+# inventory.ini
+[kube_control_plane]
+mn-192-168-3-21 ansible_host=192.168.3.21 etcd_member_name=etcd1
+mn-192-168-3-22 ansible_host=192.168.3.22 etcd_member_name=etcd2
+mn-192-168-3-23 ansible_host=192.168.3.23 etcd_member_name=etcd3
+
+[etcd:children]
+kube_control_plane
+
+# 把新节点同时列进 broken_* 组
+[broken_etcd]
+mn-192-168-3-22 ansible_host=192.168.3.22 etcd_member_name=etcd2
+mn-192-168-3-23 ansible_host=192.168.3.23 etcd_member_name=etcd3
+
+[broken_kube_control_plane]
+mn-192-168-3-22 ansible_host=192.168.3.22
+mn-192-168-3-23 ansible_host=192.168.3.23
+```
+
+`etcd_member_name` 必须唯一 —— 它是 etcd 里的成员标识，重复会导致成员列表错乱。
+
+```bash
+# 刷新 facts
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root playbooks/facts.yml
+
+# 执行恢复（= 加入新控制面）
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root recover-control-plane.yml
+```
+
+<Callout type="note" title="2.28.0 有个 etcd.env 多余引号的 bug">
+kubespray 2.28.0 在生成 `etcd.env` / `etcd-events.env` 时，`ETCD_INITIAL_CLUSTER` 的值会带上多余的引号，导致 etcd 启动失败。
+
+如果用的是这个版本，执行前先打上上游的修复（PR #12350），或者在 playbook 跑完、etcd 起不来时手工检查这两个文件：
+
+```bash
+grep ETCD_INITIAL_CLUSTER /etc/etcd.env
+# 正确：ETCD_INITIAL_CLUSTER=etcd1=https://...,etcd2=https://...
+# 错误：ETCD_INITIAL_CLUSTER="etcd1=https://...,etcd2=https://..."
+```
+这类版本特定的坑是升级 kubespray 前必须查 changelog 的原因。
+</Callout>
+
+## 扩容后验证
+
+```bash
+# 1. etcd 成员数与健康状态
+etcdctl member list -w table
+etcdctl endpoint status --write-out=table --cluster
+# 确认 IS LEADER 只有一个，所有成员 RAFT TERM 一致
+
+# 2. 新节点是 Ready 且带控制面标签与污点
+kubectl get node -l node-role.kubernetes.io/control-plane
+
+# 3. 新节点上控制面组件都在跑
+kubectl -n kube-system get pod -o wide | grep mn-192-168-3-22
+
+# 4. VIP 覆盖了新节点 —— kube-vip 的 DaemonSet 要在上面
+kubectl -n kube-system get pod -l app.kubernetes.io/name=kube-vip -o wide
+
+# 5. 真的测一次故障切换
+#    关掉当前持有 VIP 的那台，确认 kubectl 仍然可用
+```
+
+第 5 项不能省。扩容的目的就是提高容错，不实测就不知道它是否真的成立。
+
+## 替换故障控制面节点
+
+顺序很重要 —— **先把坏成员移出 etcd，再加新的**：
+
+```bash
+# 1. 从 etcd 里移除坏成员（在健康节点上执行）
+etcdctl member list -w table
+etcdctl member remove <坏成员的 ID>
+
+# 2. 从集群里删掉 Node 对象
+kubectl delete node mn-192-168-3-23
+
+# 3. inventory 里换成新节点的地址，etcd_member_name 沿用或新起一个
+#    然后把它列进 broken_* 组，跑 recover-control-plane.yml
+```
+
+<Callout type="warn" title="先 remove 再 add，不要反过来">
+如果先加新成员，集群会短暂变成「4 成员，其中 1 个是死的」：quorum 3，健康成员只有 3 个 —— 再坏任何一个就不可写了。
+
+先 remove 让集群回到「2 成员全健康」（quorum 2），再 add 变成「3 成员全健康」。虽然 2 成员那一刻容错为 0，但所有成员都是健康的，风险窗口比带着一个死成员小得多。
+</Callout>
+
+## 证书轮转
+
+kubeadm 签的证书默认有效期 **1 年**。到期后 apiserver 拒绝所有请求，`kubectl` 报 `Unauthorized` —— 这是运维日历上必须标记的事。
+
+```bash
+# 检查有效期，所有控制面节点都要查
+kubeadm certs check-expiration
+
+# CERTIFICATE                EXPIRES                  RESIDUAL TIME
+# apiserver                  Aug 19, 2027 06:00 UTC   364d
+# apiserver-etcd-client      Aug 19, 2027 06:00 UTC   364d
+# front-proxy-client         Aug 19, 2027 06:00 UTC   364d
+# CERTIFICATE AUTHORITY      EXPIRES                  RESIDUAL TIME
+# ca                         Aug 17, 2036 06:00 UTC   9y
+```
+
+注意两层：**叶子证书 1 年，CA 10 年**。日常轮转的是叶子证书。
+
+```bash
+# 手工轮转（逐台控制面节点执行）
+kubeadm certs renew all
+systemctl restart kubelet
+# 静态 Pod 方式的组件会随证书更新自动重启；host 方式的 etcd 要手工重启
+
+# 用 kubespray 轮转，更省事
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root \
+  cluster.yml --tags=k8s-certs
+```
+
+<Callout type="tip" title="把证书有效期做成监控，不要靠人记">
+证书过期是一类「完全可预测却经常发生」的故障。原因很简单：装集群的人一年后可能已经不管这个集群了。
+
+```bash
+# 拿到最短剩余天数，接进监控告警
+kubeadm certs check-expiration | awk '/^[a-z]/ {print $NF}' | grep -o '[0-9]*d' | sort -n | head -1
+```
+建议在剩余 60 天时告警。另外 kubespray 的 `auto_renew_certificates: true` 可以开启自动轮转，但仍然要监控 —— 自动机制自己也会坏。
+</Callout>
+
+### 证书已经过期了怎么办
+
+```bash
+# kubectl 已经不可用，只能在控制面节点上本地操作
+kubeadm certs renew all
+systemctl restart kubelet
+
+# admin.conf 也过期了，重新生成
+kubeadm kubeconfig user --client-name=kubernetes-admin \
+  --org=system:masters > /root/.kube/config
+
+# 逐台做完所有控制面节点，然后验证
+kubectl get node
+```
+
+工作节点的 kubelet 证书通常会自动轮转（`rotateCertificates: true`），但如果它在过期后没能连上 apiserver，可能需要手工重新 join。
+
+<Quiz
+  id="cps-1"
+  question="要把 3 台控制面扩到 5 台，以下做法哪个是对的？"
+  options={[
+    { text: '用 recover-control-plane.yml，把新节点列进 broken_* 组，一台一台加', correct: true },
+    { text: '用 scale.yml 加上两个新节点', feedback: 'scale.yml 是给工作节点设计的，不会正确处理 etcd 成员变更，可能导致 etcd 配置错乱。' },
+    { text: '两台同时加，减少偶数成员的窗口', feedback: '同时加会让集群一次性从 3 跳到 5，中间过程不可控 —— 如果一台没起来，就停在 4 成员且有 1 个不健康的状态，容错为 0。' },
+    { text: '先把 3 台缩到 1 台，再直接扩到 5 台', feedback: '毫无必要地把集群降到零容错，风险极大。' },
+  ]}
+  explain={<>kubespray 处理控制面扩容的方式确实反直觉：用 <code>recover-control-plane.yml</code> 并把新节点当成「待恢复的坏节点」，从而走安全的 etcd 成员添加逻辑。<code>scale.yml</code> 在这里是错的工具。一台一台加的意义是每一步都可验证：加完一台先确认 <code>member list</code> 和 <code>endpoint health</code> 全绿，再动下一台。</>}
+/>
+
+<Quiz
+  id="cps-2"
+  question="替换一台已经宕机的控制面节点，正确顺序是？"
+  options={[
+    { text: '先 etcdctl member remove 移除坏成员，再加入新节点', correct: true },
+    { text: '先加入新节点，再移除坏成员', feedback: '这会经过「4 成员含 1 个死的」状态：quorum 3，健康的只有 3 个，再坏一个就完全不可写。' },
+    { text: '直接把新节点的 IP 改成坏节点的 IP，让它顶替', feedback: 'etcd 成员身份不只看 IP，还有成员 ID 和数据目录。新机器上没有对应的 etcd 数据，无法直接顶替。' },
+    { text: '先删 Node 对象，etcd 成员会自动清理', feedback: 'Node 对象和 etcd 成员是两套独立的注册信息，删前者不会移除后者。' },
+  ]}
+  explain={<>关键是比较两条路径中的最差状态：<strong>先 remove</strong> 会经过「2 成员全健康」（quorum 2，容错 0 但无坏成员）；<strong>先 add</strong> 会经过「4 成员含 1 死」（quorum 3，只有 3 个健康，容错 0 且已有故障）。后者的风险窗口明显更大，因为它是带病运行。</>}
+/>
+
+## 这一节的落点
+
+- **偶数成员是最危险的状态**，成员变更要尽快通过；2 成员比 1 成员更差
+- 变更前三件事：**快照备份、确认 etcd 全健康、备份 inventory**
+- 扩控制面用 `recover-control-plane.yml`（新节点列进 `broken_*`），**不是 `scale.yml`**
+- 替换故障节点：**先 remove 再 add**
+- 叶子证书 1 年、CA 10 年；把剩余天数接进监控，60 天告警
+- 每次扩容后**实测一次故障切换**，否则不知道容错是否真的成立

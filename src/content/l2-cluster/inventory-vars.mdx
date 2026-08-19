@@ -1,0 +1,278 @@
+同一份 playbook，配置写法决定了这套集群是能用两年，还是三个月后推倒重来。
+
+kubespray 有几百个变量，但真正影响长期运维的就那么十几个 —— 它们的共同特点是**装完之后改不动或改起来很痛**。这一节把这些逐项过一遍。
+
+## group_vars 的组织
+
+```
+inventory/mycluster/
+├── inventory.ini              节点与角色
+├── credentials/               自动生成的证书密钥，别提交进 Git
+└── group_vars/
+    ├── all/
+    │   ├── all.yml            全局：负载均衡端口、NTP、代理
+    │   ├── containerd.yml     运行时与镜像源
+    │   ├── etcd.yml           etcd 数据目录与配额
+    │   └── offline.yml        离线部署的各种下载地址
+    └── k8s_cluster/
+        ├── k8s-cluster.yml    核心：网段、kube-proxy、DNS、版本
+        ├── addons.yml         随集群一起装的组件
+        ├── k8s-net-cilium.yml CNI 的详细参数
+        └── kube_control_plane.yml
+```
+
+## 网段：三个字段，装完改不了
+
+```yaml
+# group_vars/k8s_cluster/k8s-cluster.yml
+kube_service_addresses: 172.23.0.0/16     # Service CIDR
+kube_pods_subnet: 172.24.0.0/13           # Pod CIDR
+kube_network_node_prefix: 24              # 每节点分到 /24
+```
+
+这组配置对应的规模上限（L0《集群规划》里算过）：
+
+| 字段 | 值 | 含义 |
+| --- | --- | --- |
+| `kube_pods_subnet` | `/13` | Pod 网络总空间 |
+| `kube_network_node_prefix` | `24` | 每节点 254 个 Pod IP |
+| 组合结果 | 2^(24−13) = **2048 个节点** | 上限 |
+| `kube_service_addresses` | `/16` | 约 65000 个 Service |
+
+<Callout type="trap" title="这三个字段是整份配置里最不可逆的">
+改它们意味着所有节点的 Pod 网络重划、所有 Service 重新分配 IP —— 等于重建集群。
+
+所以规划时按**三年后的规模**留一倍余量。`/13` 撑 2048 节点，比常见的 `/16`（256 节点）宽裕得多，而 Pod CIDR 用的是私有地址，放大不花钱。真正的成本是和公司现有网络规划撞段，所以这件事必须和网络团队一起定。
+
+另外注意 `kube_service_addresses` 不能和 `kube_pods_subnet` 重叠，也不能和节点网段、存储网段重叠。
+</Callout>
+
+## kube-proxy 模式
+
+```yaml
+kube_proxy_mode: ipvs           # 不要用默认的 iptables
+kube_proxy_strict_arp: true     # MetalLB 的 L2 模式要求这一项
+```
+
+L1《网络模型》讲过原因：iptables 是线性匹配，Service 多了之后数据面和控制面都会退化。`ipvs` 用内核哈希表，O(1) 查找。
+
+`kube_proxy_strict_arp: true` 是 MetalLB 在 L2 模式下的硬要求 —— 没有它，VIP 的 ARP 应答会混乱，表现是 LoadBalancer 的 IP 时通时不通。**即使现在还没装 MetalLB，也建议先开着**，免得以后要改 kube-proxy 再重启。
+
+## DNS：ndots 和 NodeLocal DNSCache
+
+```yaml
+dns_mode: coredns
+ndots: 2                        # 默认是 5
+enable_nodelocaldns: true       # 每节点一个 DNS 缓存
+nodelocaldns_ip: 169.254.25.10
+resolvconf_mode: host_resolvconf
+```
+
+这两项直接对应 L1 讲的 DNS 放大问题：
+
+- `ndots: 2` 把「解析外部域名要先拼三次 search 域」的开销降下来
+- `enable_nodelocaldns: true` 在每个节点起一个缓存，把重复查询挡在本地
+
+<Callout type="tip" title="这两项应该作为默认配置">
+它们对小集群没有坏处，对大集群是必需的。而且都属于「装的时候顺手开，之后要改就得动全集群 DNS」的类型。
+
+`ndots: 2` 有一个需要注意的场景：如果应用依赖「只写 Service 名、靠 search 域补全跨命名空间访问」（比如写 `mysql.other-ns` 期望补成 `mysql.other-ns.svc.cluster.local`），那 2 个点刚好够用。再降到 1 就会破坏这种写法。
+</Callout>
+
+## 镜像源：国内环境的关键
+
+```yaml
+# group_vars/all/containerd.yml
+containerd_registries_mirrors:
+  - prefix: docker.io
+    mirrors:
+      - host: https://mir.blsc.cn/v2/docker.io
+        capabilities: ["pull", "resolve"]
+        skip_verify: false
+        override_path: true
+  - prefix: registry.k8s.io
+    mirrors:
+      - host: https://mir.blsc.cn/v2/registry.k8s.io
+        capabilities: ["pull", "resolve"]
+        skip_verify: false
+        override_path: true
+  # gcr.io、ghcr.io、quay.io 同理
+```
+
+<Callout type="warn" title="镜像源配在 containerd 层，不是在 YAML 里改镜像名">
+两种做法的区别很大：
+
+- **改镜像名**（`image: mir.blsc.cn/xxx/nginx`）—— 侵入业务清单，换镜像源要改所有 YAML，而且第三方 Helm chart 改不动
+- **配 containerd mirror** —— 业务照常写 `nginx:1.27`，containerd 在拉取时自动替换。换源只改节点配置
+
+后者是唯一可持续的做法。`override_path: true` 这一项容易漏，它决定路径怎么拼 —— 不带的话某些镜像源会 404。
+</Callout>
+
+`containerd_discard_unpacked_layers: false` 也值得一提：设为 `true` 能省磁盘（丢掉解包后不再需要的原始层），但代价是 `crictl` 无法导出镜像、离线迁移镜像会失败。运维便利性通常比那点磁盘更值钱。
+
+## etcd
+
+```yaml
+# group_vars/all/etcd.yml
+etcd_data_dir: /var/lib/etcd
+etcd_deployment_type: host              # host 或 kubeadm（静态 Pod）
+etcd_quota_backend_bytes: "8589934592"  # 8GB
+```
+
+三项都很关键：
+
+| 字段 | 为什么这么配 |
+| --- | --- |
+| `etcd_data_dir` | 必须指向那块通过 fio 验收的独占 NVMe |
+| `etcd_deployment_type: host` | 以 systemd 服务跑，不依赖 kubelet —— kubelet 挂了 etcd 还活着，排障时更简单 |
+| `etcd_quota_backend_bytes` | **默认只有 2GB**，很容易撞上 |
+
+<Callout type="trap" title="默认 2GB 配额是个定时炸弹">
+etcd 用 MVCC，每次对象增删改都产生一个新 revision，历史版本会不断累积。默认 2GB 配额下，一个对象较多、变更频繁的集群几个月就会撞上：
+
+```
+etcdserver: mvcc: database space exceeded
+```
+
+一旦触发 NOSPACE alarm，etcd 进入维护模式 —— **只允许读和删除，拒绝所有写入**。表现是 apiserver 全面报错、Pod 调度不了、`kubectl apply` 全失败，看起来像整个集群挂了。
+
+装的时候就设成 8GB（官方建议上限）。已经装好的集群改法：
+
+```bash
+# 所有控制面节点都要改
+vim /etc/etcd.env
+ETCD_QUOTA_BACKEND_BYTES=8589934592
+systemctl restart etcd
+
+# 验证
+set -a && source /etc/etcd.env && set +a
+curl --cert $ETCDCTL_CERT --key $ETCDCTL_KEY --cacert $ETCDCTL_CACERT \
+  $ETCDCTL_ENDPOINTS/metrics | grep quota
+# etcd_server_quota_backend_bytes 8.589934592e+09
+```
+救火的具体操作在《etcd 运维》那一节。
+</Callout>
+
+## 高可用入口：kube-vip
+
+```yaml
+# group_vars/k8s_cluster/addons.yml
+kube_vip_enabled: true
+kube_vip_arp_enabled: true
+kube_vip_controlplane_enabled: true
+kube_vip_address: 192.168.3.101       # 这个 IP 不能被 DHCP 分配出去
+kube_vip_interface: eth0
+```
+
+kube-vip 在控制面节点上做 VIP 漂移：任一节点挂了，VIP 漂到活着的节点，`kubectl` 和 kubelet 的连接不断。
+
+三个要点：
+
+1. `kube_vip_address` 必须是**同网段内一个没被占用、也不会被 DHCP 分配**的地址
+2. `kube_vip_interface` 要填实际承载该网段的网卡名（多网卡机器容易填错）
+3. kubeconfig 和所有节点的 kubelet 都必须通过这个 VIP 访问 apiserver
+
+## addons：哪些该开，哪些自己管
+
+```yaml
+helm_enabled: false
+metrics_server_enabled: false
+cert_manager_enabled: false
+metallb_enabled: false
+ingress_alb_enabled: false
+gateway_api_enabled: false
+node_feature_discovery_enabled: false
+local_path_provisioner_enabled: false
+```
+
+上面这份配置里几乎全是 `false`，只开了 kube-vip。这不是偷懒，是刻意的。
+
+<Callout type="tip" title="为什么把 addons 都关掉，自己用 Helm 管">
+kubespray 装的 addon 有三个问题：
+
+1. **版本被 kubespray 版本绑定** —— 想升级 cert-manager 到新版本，得等 kubespray 支持
+2. **配置能力有限** —— 只暴露 kubespray 定义的那几个变量，chart 的其它 values 改不了
+3. **升级集群时会连带动它们** —— 跑 `upgrade-cluster.yml` 可能把 addon 一起改了，风险面变大
+
+唯一的例外是 **kube-vip**：它是控制面高可用的一部分，必须在集群起来的同时就位，不能事后装。
+
+其余组件用 Helm / Helmwave 独立管理，各自有自己的版本和升级节奏。这样「升级 K8s」和「升级 Ingress」是两件独立的事，不会互相牵连。
+</Callout>
+
+## 其它几项
+
+```yaml
+# group_vars/all/all.yml
+loadbalancer_apiserver_port: 6443
+loadbalancer_apiserver_healthcheck_port: 8081
+ntp_enabled: false              # 通常在 OS 基线里用 systemd-timesyncd 管
+```
+
+```yaml
+# k8s-cluster.yml
+container_manager: containerd
+kube_proxy_strict_arp: true
+kube_encrypt_secret_data: false     # 开了会加密 etcd 里的 Secret，但要管密钥轮转
+kubernetes_audit: false             # 审计日志：合规场景要开，注意日志量
+kube_log_level: 2
+k8s_image_pull_policy: IfNotPresent
+```
+
+`kube_encrypt_secret_data` 和 `kubernetes_audit` 是两个「有合规需求就必须开、开了就要配套运维」的开关：前者要管加密密钥的存储与轮转，后者要规划审计日志的落盘与采集（日志量可能很大）。**建议装的时候就定，事后开需要重启 apiserver 并处理已有数据。**
+
+## 改完配置怎么安全重跑
+
+```bash
+# 1. 先只看会改什么，不真改（部分 task 支持）
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root cluster.yml --check --diff
+
+# 2. 只跑相关的 tags
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root cluster.yml --tags=coredns
+
+# 3. 涉及控制面的改动，先在一台上验证
+ansible-playbook -i ... cluster.yml --limit=mn-192-168-3-21
+```
+
+<Callout type="warn" title="inventory 目录必须进 Git">
+`inventory/mycluster/` 是这套集群的**唯一事实来源**。它不进版本库的话：
+
+- 没人知道当前配置和上次有什么不同
+- 换个人接手就得从集群里反向推配置
+- 出事时无法回滚到上一个已知可用的配置
+
+例外是 `credentials/` 目录（自动生成的证书密钥），加进 `.gitignore`，另外用密钥管理系统保管。
+</Callout>
+
+<Quiz
+  id="vars-1"
+  question="集群跑了半年后报 etcdserver: mvcc: database space exceeded，kubectl apply 全部失败。根本原因和预防措施是？"
+  options={[
+    { text: 'etcd_quota_backend_bytes 默认只有 2GB，MVCC 历史版本累积撞上配额；装的时候就该设成 8GB', correct: true },
+    { text: 'etcd 磁盘满了，扩盘就行', feedback: '这是 etcd 的逻辑配额，不是文件系统空间。盘可能还很空，但 etcd 自己拒绝写入了。' },
+    { text: 'etcd 版本太老，升级解决', feedback: '与版本无关，是配额机制本身的行为。' },
+    { text: '对象太多，删一些 Pod 就好', feedback: '删对象反而会产生新的 revision。要真正释放空间必须 compact + defrag。' },
+  ]}
+  explain={<>etcd 的 MVCC 会为每次变更保留历史版本，2GB 默认配额在变更频繁的集群里几个月就撞上。触发后进入 NOSPACE 维护模式，<strong>只读和删，拒绝写入</strong> —— 看起来像整个集群挂了。装的时候设 8GB 是零成本的预防；已经触发的话要 <code>etcdctl compact</code> + <code>defrag</code> + <code>alarm disarm</code>，具体见《etcd 运维》。顺手一提：<code>ttlSecondsAfterFinished</code> 没配的 CronJob 是对象膨胀的常见来源。</>}
+/>
+
+<Quiz
+  id="vars-2"
+  question="关于 addons.yml 里把组件都设成 false、改用 Helm 独立管理，下面哪些是合理的理由？"
+  options={[
+    { text: 'addon 版本会被 kubespray 版本绑定，无法独立升级', correct: true },
+    { text: 'kubespray 只暴露有限的变量，chart 的其它 values 改不了', correct: true },
+    { text: '升级集群时会连带改动 addon，扩大了变更风险面', correct: true },
+    { text: 'kube-vip 也应该关掉，用 Helm 装', feedback: 'kube-vip 是例外 —— 它是控制面高可用的组成部分，必须在集群起来的同时就位，没法事后装。' },
+  ]}
+  explain={<>核心是<strong>解耦变更节奏</strong>：「升级 K8s」和「升级 Ingress」应该是两件独立的事。kubespray 管的 addon 会把这两件事绑在一起，每次集群升级都要顺带评估一堆组件的兼容性。kube-vip 是唯一的例外，因为它是集群可访问性的前提条件。</>}
+/>
+
+## 这一节的落点
+
+- **三个网段字段装完改不了**，按三年规模留一倍余量
+- `kube_proxy_mode: ipvs` + `strict_arp: true`，即使还没装 MetalLB 也先开
+- `ndots: 2` + `enable_nodelocaldns: true` 应当作为默认配置
+- 镜像源配在 **containerd 层**，别去改业务 YAML 里的镜像名
+- **`etcd_quota_backend_bytes` 默认 2GB 是定时炸弹**，装的时候就设 8GB
+- addon 全关、用 Helm 独立管，唯一例外是 kube-vip
+- `inventory/` 目录进 Git，`credentials/` 除外

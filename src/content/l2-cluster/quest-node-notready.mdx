@@ -1,0 +1,289 @@
+凌晨两点，告警：`cn-192-168-3-50 NotReady`。上面跑着十几个业务 Pod。
+
+`NotReady` 是个信息量很低的状态 —— 它只说明 kubelet 停止上报心跳了，可能的原因有十几种。这一关练的是**用固定顺序收敛**，而不是凭直觉挨个试。
+
+## 排查顺序：从外向内四层
+
+```
+第 1 层  控制面视角     kubectl get/describe node  —— 集群知道什么
+第 2 层  节点侧 kubelet  systemctl status / journalctl —— kubelet 自己怎么说
+第 3 层  运行时与资源    crictl / df / free —— 底下的东西还活着吗
+第 4 层  网络与证书      到 apiserver 的连通性 —— 心跳发得出去吗
+```
+
+顺序的意义是**每一层都能排除掉一批可能**。跳着查最容易漏掉真正的原因。
+
+<Terminal
+  id="node-notready"
+  host="root@mn-192-168-3-21"
+  intro={`模拟终端：cn-192-168-3-50 变成 NotReady 已 8 分钟。
+先在控制面看，需要时再切到节点侧（本演练里节点侧命令直接可用）。
+输入 goals 看目标，hint 要提示。`}
+  commands={[
+    {
+      cmd: 'kubectl get node',
+      goal: '确认范围：是一台还是一批节点出问题',
+      hint: '先看是个案还是面。一批节点同时 NotReady，方向完全不同。',
+      output: `NAME              STATUS     ROLES           AGE    VERSION
+mn-192-168-3-21   Ready      control-plane   180d   v1.31.4
+mn-192-168-3-22   Ready      control-plane   180d   v1.31.4
+mn-192-168-3-23   Ready      control-plane   180d   v1.31.4
+cn-192-168-3-50   NotReady   <none>          180d   v1.31.4
+cn-192-168-3-51   Ready      <none>          180d   v1.31.4
+
+# 只有一台，控制面正常 —— 排除了控制面故障和大面积网络问题`,
+    },
+    {
+      cmd: 'kubectl describe node cn-192-168-3-50',
+      goal: '读 Conditions，让 kubelet 上报的最后状态告诉你原因',
+      hint: 'Conditions 里的 DiskPressure / MemoryPressure 和 Ready 的 message 是关键。',
+      output: `Name:               cn-192-168-3-50
+Taints:             node.kubernetes.io/unreachable:NoExecute
+                    node.kubernetes.io/unreachable:NoSchedule
+Conditions:
+  Type             Status    LastHeartbeatTime  Reason              Message
+  ----             ------    -----------------  ------              -------
+  MemoryPressure   Unknown   2026-08-19 01:52   NodeStatusUnknown   Kubelet stopped posting node status.
+  DiskPressure     True      2026-08-19 01:52   KubeletHasDiskPressure   kubelet has disk pressure
+  Ready            Unknown   2026-08-19 01:52   NodeStatusUnknown   Kubelet stopped posting node status.
+
+Events:
+  Type     Reason                Age    Message
+  ----     ------                ----   -------
+  Warning  EvictionThresholdMet  12m    Attempting to reclaim ephemeral-storage
+  Warning  FreeDiskSpaceFailed   11m    Failed to garbage collect required amount of images
+  Normal   NodeNotReady          8m     Node cn-192-168-3-50 status is now: NodeNotReady
+
+# 关键线索：NotReady 之前 4 分钟就已经 DiskPressure 了`,
+    },
+    {
+      cmd: 'kubectl get pod -A -o wide --field-selector spec.nodeName=cn-192-168-3-50',
+      goal: '评估影响面：上面有哪些负载、有没有单副本的有状态服务',
+      hint: '先知道损失是什么，再决定处置的激烈程度。',
+      output: `NAMESPACE     NAME                     READY   STATUS        RESTARTS   AGE
+default       web-7d9f8b6c4-x2krn      1/1     Terminating   0          3d
+default       web-7d9f8b6c4-mn4pq      1/1     Terminating   0          3d
+default       redis-0                  1/1     Terminating   0          30d
+kube-system   cilium-8xk2n             1/1     Running       0          180d
+kube-system   csi-rbdplugin-p9v3f      1/1     Running       0          180d
+monitoring    node-exporter-k4m8s      1/1     Running       0          180d
+
+# web 有多副本，redis-0 是 StatefulSet 单副本 —— 这个要小心`,
+    },
+    {
+      cmd: 'ssh cn-192-168-3-50 systemctl status kubelet',
+      goal: '到节点侧确认 kubelet 进程本身的状态',
+      hint: 'ssh 通说明机器活着、网络也通 —— 这就排除了宕机和网络分区。',
+      output: `● kubelet.service - Kubernetes Kubelet Server
+     Loaded: loaded (/etc/systemd/system/kubelet.service; enabled)
+     Active: active (running) since Mon 2026-02-20 10:15:33 CST; 180d ago
+   Main PID: 2847 (kubelet)
+      Tasks: 42
+     Memory: 128.4M
+
+# 注意：kubelet 进程还在跑，没有崩溃 —— 所以问题不是「kubelet 挂了」`,
+    },
+    {
+      cmd: 'ssh cn-192-168-3-50 journalctl -u kubelet --since "-15m" --no-pager | tail -20',
+      goal: '看 kubelet 日志，找出它为什么停止上报',
+      hint: 'kubelet 活着但不上报状态，日志里一定写了原因。',
+      output: `Aug 19 01:48:02 kubelet[2847]: I0819 eviction_manager.go:availableBytes=524288 threshold=10%
+Aug 19 01:48:02 kubelet[2847]: W0819 eviction_manager.go: attempting to reclaim ephemeral-storage
+Aug 19 01:48:15 kubelet[2847]: E0819 image_gc_manager.go: failed to garbage collect required amount of images. Wanted to free 8589934592 bytes, but freed 104857600 bytes
+Aug 19 01:50:33 kubelet[2847]: E0819 kubelet.go: skipping pod synchronization - container runtime is down
+Aug 19 01:51:07 kubelet[2847]: E0819 remote_runtime.go: Status from runtime service failed: rpc error: code = DeadlineExceeded
+Aug 19 01:52:11 kubelet[2847]: E0819 kubelet_node_status.go: error updating node status, will retry: failed to patch status: context deadline exceeded
+Aug 19 01:52:44 kubelet[2847]: E0819 controller.go: failed to update lease, error: context deadline exceeded
+
+# 链条清楚了：磁盘满 → 镜像回收失败 → 容器运行时无响应 → 状态上报超时`,
+    },
+    {
+      cmd: 'ssh cn-192-168-3-50 df -h',
+      goal: '确认磁盘用量，定位是哪个目录吃满的',
+      hint: '看 /var 所在的那个文件系统。',
+      output: `Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p2  200G  199G  512M 100% /
+tmpfs           126G     0  126G   0% /dev/shm
+/dev/nvme1n1    3.5T  1.2T  2.3T  35% /data
+
+# 系统盘 100% 满，而数据盘还有 2.3T 空闲 —— 典型的目录规划问题`,
+    },
+    {
+      cmd: 'ssh cn-192-168-3-50 du -sh /var/lib/containerd /var/log/pods /var/lib/kubelet',
+      goal: '找出磁盘大户，确定根因',
+      hint: '节点上三个大户：镜像层、容器日志、kubelet 的卷目录。',
+      output: `142G    /var/lib/containerd
+48G     /var/log/pods
+2.1G    /var/lib/kubelet
+
+# 镜像层 142G + 容器日志 48G，把 200G 系统盘吃光了`,
+    },
+    {
+      cmd: 'ssh cn-192-168-3-50 crictl ps',
+      output: `WARN[0010] image connect using default endpoints
+E0819 connect: connection error: DeadlineExceeded
+
+# containerd 也无响应了 —— 磁盘满导致它写不了自己的元数据`,
+    },
+    {
+      cmd: 'ssh cn-192-168-3-50 ls /var/log/pods | wc -l',
+      output: `1847
+
+# 1847 个 Pod 的日志目录 —— 大量已删除 Pod 的日志没被清理`,
+    },
+    {
+      cmd: 'kubectl get node cn-192-168-3-50 -o jsonpath={.status.allocatable}',
+      output: `{"cpu":"31500m","ephemeral-storage":"189Gi","hugepages-1Gi":"0","hugepages-2Mi":"0","memory":"128823Mi","pods":"110"}
+
+# ephemeral-storage 的 Allocatable 是 189Gi，但根本没给系统留够余量`,
+    },
+  ]}
+/>
+
+## 根因链
+
+```
+系统盘只有 200G，且 containerd 镜像目录与系统盘共用
+   ↓
+镜像层累积到 142G + 容器日志 48G 未限制大小
+   ↓
+磁盘 100% 满
+   ↓
+kubelet 触发 DiskPressure，尝试回收镜像但只释放了 100MB（正在用的镜像删不掉）
+   ↓
+containerd 写不了自己的元数据，CRI 调用超时
+   ↓
+kubelet 无法同步 Pod、无法 patch node status、无法更新 lease
+   ↓
+心跳停止 → 控制面标记 NotReady → 打上 unreachable 污点 → Pod 开始驱逐
+```
+
+注意这个故障的形状：**kubelet 进程一直活着**，它只是干不了活。如果第一反应是 `systemctl restart kubelet`，重启完照样 NotReady，而且浪费了时间。
+
+## 处置
+
+```bash
+# 1. 先止血：清掉最大的可回收项 —— 已停止容器的日志
+ssh cn-192-168-3-50 'find /var/log/pods -type f -name "*.log" -mtime +7 -delete'
+
+# 2. 清理未被使用的镜像
+ssh cn-192-168-3-50 'crictl rmi --prune'    # containerd 恢复响应后才能执行
+
+# 3. containerd 恢复后 kubelet 会自动恢复上报，节点回到 Ready
+kubectl get node cn-192-168-3-50 -w
+
+# 4. 确认 Pod 恢复；redis-0 这类单副本有状态服务要单独核对数据
+kubectl get pod -A -o wide --field-selector spec.nodeName=cn-192-168-3-50
+```
+
+<Callout type="warn" title="磁盘满的节点，重启 kubelet 或 containerd 都没用">
+两个进程都需要写盘才能工作。盘满的情况下重启它们，只是让它们在启动阶段就失败 —— 而且可能让原本还能读的元数据变成损坏状态。
+
+**先腾空间，再考虑重启服务。** 顺序反了会把「节点不可用」变成「节点需要重装」。
+</Callout>
+
+## 治本
+
+这次故障暴露的是三个配置缺失：
+
+```toml
+# 1. 限制容器日志大小 —— /etc/containerd/config.toml
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  # 每个容器日志最大 100MB，保留 3 个文件
+  max_container_log_line_size = 16384
+```
+
+```yaml
+# 2. kubelet 侧配足预留与镜像回收阈值
+# /var/lib/kubelet/config.yaml
+kubeReserved:
+  ephemeral-storage: 20Gi
+evictionHard:
+  nodefs.available: "10%"
+  imagefs.available: "15%"
+imageGCHighThresholdPercent: 80      # 到 80% 就开始回收，不要等到告急
+imageGCLowThresholdPercent: 70
+```
+
+```bash
+# 3. 把镜像与日志目录挪到数据盘（这次故障的根本原因）
+mkdir -p /data/containerd /data/kubelet
+# 通过 bind mount 挂到标准路径，写进 fstab
+echo "/data/containerd /var/lib/containerd none defaults,bind 0 0" >> /etc/fstab
+echo "/data/kubelet /var/lib/kubelet none defaults,bind 0 0" >> /etc/fstab
+```
+
+<Callout type="tip" title="把磁盘水位做成告警，这是最划算的一条">
+`DiskPressure` 出现在 NotReady **之前 4 分钟**。也就是说这次故障有 4 分钟的预警窗口，只是没人看。
+
+```promql
+# 节点文件系统使用率超过 80%
+(1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) > 0.8
+
+# 直接抓 kubelet 上报的 DiskPressure condition
+kube_node_status_condition{condition="DiskPressure",status="true"} == 1
+```
+第二条尤其值得配 —— 它是 kubelet 自己的判断，比阈值猜测更准。
+</Callout>
+
+## NotReady 的完整排查清单
+
+这一关走的是磁盘那条路。其它常见原因按同样的四层顺序排：
+
+| 层 | 检查 | 命令 |
+| --- | --- | --- |
+| 1 | 是一台还是一批 | `kubectl get node` |
+| 1 | Conditions 与 Events | `kubectl describe node` |
+| 1 | 影响面 | `get pod -o wide --field-selector spec.nodeName=` |
+| 2 | 机器是否活着（**有状态服务必查**） | `ssh` / IPMI / BMC |
+| 2 | kubelet 进程与日志 | `systemctl status kubelet`、`journalctl -u kubelet` |
+| 3 | 磁盘 | `df -h`、`du -sh /var/lib/containerd /var/log/pods` |
+| 3 | 内存与 OOM | `free -h`、`dmesg -T \| grep -i oom` |
+| 3 | 运行时 | `crictl ps`、`systemctl status containerd` |
+| 4 | 到 apiserver 的连通性 | `curl -k https://<vip>:6443/healthz` |
+| 4 | 证书是否过期 | `openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -dates` |
+| 4 | 时间偏差 | `timedatectl status` |
+
+对应关系（看到什么想到什么）：
+
+| 现象 | 指向 |
+| --- | --- |
+| kubelet 进程已死 | 配置错误、OOM、二进制损坏 |
+| kubelet 活着但报 `context deadline exceeded` | **运行时无响应** —— 通常是磁盘 |
+| kubelet 报 `Unauthorized` | **证书过期**或时间偏差 |
+| kubelet 报连接超时 | 到 apiserver 的网络、VIP 漂移 |
+| ssh 不通、IPMI 显示已关机 | 真宕机，可以删 Node 对象 |
+| ssh 不通但 IPMI 显示在运行 | **可能是网络分区，有状态服务不要贸然删 Node** |
+
+<Quiz
+  id="quest-nr-1"
+  question="kubelet 进程 active (running)，但节点仍然 NotReady，日志里刷 context deadline exceeded 和 container runtime is down。第一步该做什么？"
+  options={[
+    { text: '查节点磁盘用量与 containerd 状态', correct: true },
+    { text: 'systemctl restart kubelet', feedback: 'kubelet 本身没崩，它是被下游卡住的。而且如果磁盘满了，重启只会让它在启动阶段失败。' },
+    { text: '删掉这个 Node 对象让 Pod 迁走', feedback: '机器活着、容器还在跑，删 Node 会造成脑裂。而且这只是转移问题，节点本身没修好。' },
+    { text: '重启节点', feedback: '可能有效但过于激烈，而且盘满的话重启后照样满 —— 只是把故障重现一遍。' },
+  ]}
+  explain={<><code>container runtime is down</code> + <code>DeadlineExceeded</code> 是明确的信号：kubelet 在等 containerd 而等不到。containerd 无响应最常见的原因就是磁盘写满（它连自己的元数据都写不了）。这个组合应该直接跳到 <code>df -h</code>，而不是重启服务 —— 磁盘满的情况下重启任何写盘的服务都可能让状态更糟。</>}
+/>
+
+<Quiz
+  id="quest-nr-2"
+  question="这次故障有 4 分钟的预警窗口没被利用。以下哪些监控能提前捕捉到？"
+  options={[
+    { text: 'kube_node_status_condition{condition="DiskPressure"} == 1', correct: true },
+    { text: '节点根文件系统使用率超过 80% 的告警', correct: true },
+    { text: '/var/lib/containerd 目录大小的趋势监控', correct: true },
+    { text: '节点 NotReady 的告警', feedback: 'NotReady 就是故障本身，此时已经晚了 —— 这是结果告警，不是预警。' },
+  ]}
+  explain={<>三个正确选项分别对应三个提前量：<code>DiskPressure</code> 是 kubelet 自己的判断（最准，4 分钟提前量）；使用率 80% 阈值更早（小时级提前量）；目录大小趋势最早（天级，能看出「照这个速度还有几天满」）。三层叠加才能既不漏也不吵。而 NotReady 告警是必要的兜底，但它已经是事故通知了。</>}
+/>
+
+## 这一关的收获
+
+- **固定四层顺序**：控制面 → kubelet → 运行时与资源 → 网络与证书，每层排除一批可能
+- `describe node` 的 Conditions 里往往写着 NotReady **之前**发生了什么 —— 那才是根因
+- **kubelet 活着但不上报**，指向下游（运行时、磁盘、网络），不要盲目重启
+- 磁盘满时**先腾空间再重启服务**，反了会把不可用变成需要重装
+- 处置之前先看影响面，单副本有状态服务要区别对待
+- 这类故障几乎都有预警窗口，`DiskPressure` + 使用率 + 趋势三层监控就能抓住

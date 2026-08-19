@@ -1,0 +1,161 @@
+kubelet 自己不跑容器。它把「起一个容器」这件事通过 CRI 交给 containerd，containerd 再交给 runc。
+
+这条链路有三段，任何一段断了，现象都是「节点 NotReady」或者「Pod 卡在 ContainerCreating」。所以排障时得知道自己在看哪一段。
+
+## 完整调用链
+
+```
+kubelet
+  │  gRPC over unix socket
+  │  /run/containerd/containerd.sock
+  ▼
+containerd ──── CRI plugin（实现 RuntimeService / ImageService）
+  │
+  ├─ 镜像：拉取、解包成 snapshot（OverlayFS 层）
+  └─ 容器：创建 task
+        │  shim 进程，每个 Pod 一个
+        ▼
+   containerd-shim-runc-v2
+        │
+        ▼
+      runc ──── 真正调 clone()、设 namespace、写 cgroup，然后 exec 用户进程
+```
+
+CRI 只有两个服务：
+
+| 服务 | 管什么 | kubelet 什么时候调 |
+| --- | --- | --- |
+| **RuntimeService** | sandbox 与容器的增删查、exec、日志 | 创建 Pod、探针、`kubectl exec` |
+| **ImageService** | 镜像拉取、列举、删除、磁盘统计 | 起容器前拉镜像、磁盘压力时回收 |
+
+<Callout type="note" title="为什么要有 shim 这一层">
+`runc` 是个「跑完就退出」的命令行工具 —— 它设置好 namespace 和 cgroup，exec 用户进程，然后自己退出。那谁来当容器进程的父进程、收它的退出码？
+
+这就是 shim 的作用。每个 Pod 一个 shim 进程，它常驻，持有容器的 stdio 和退出状态。好处是 **containerd 自己可以重启而不杀掉容器** —— 升级 containerd 不会导致业务中断。这也是为什么 `systemctl restart containerd` 通常是安全的，而 `systemctl restart kubelet` 也一样。
+</Callout>
+
+## pause 容器与 Pod sandbox
+
+每个 Pod 起来时，第一个被创建的容器不是你写的那个，而是 **pause**：
+
+```bash
+crictl pods                       # 看 sandbox
+crictl ps -a                      # 看容器
+ps -ef | grep pause               # 宿主机上能看到 pause 进程
+```
+
+pause 容器什么都不干，它的存在只为一件事：**持有 namespace**。
+
+```
+Pod sandbox（pause 容器）
+  ├─ network namespace  ← Pod IP 挂在这里
+  ├─ ipc namespace
+  └─ uts namespace
+       ▲
+       │ 业务容器 join 进来，共享上面这几个 namespace
+       │
+  ┌────┴────┬─────────┐
+  容器 A    容器 B    initContainer
+```
+
+这解释了 L0 第一节留下的那个问题：同 Pod 内的容器为什么能 `localhost` 互访 —— 它们 join 了同一个 pause 容器的 network namespace。也解释了为什么**业务容器反复重启，Pod IP 却不变**：IP 属于 sandbox，业务容器重启不重建 sandbox。
+
+<Callout type="warn" title="sandbox 没起来，看的地方不一样">
+`kubectl describe pod` 里如果看到 `FailedCreatePodSandBox`，那问题在 **CNI**，不在你的镜像或命令 —— sandbox 的网络是 CNI 插件配的。
+
+典型报错：`failed to setup network for sandbox ... plugin type="cilium-cni" failed`。这时候去查 CNI 的 DaemonSet、节点上 `/etc/cni/net.d/` 的配置文件，以及 IP 地址池有没有耗尽，而不是去查业务镜像。
+</Callout>
+
+## crictl：kubectl 看不到的时候用它
+
+`kubectl` 走 apiserver，节点失联时就用不了了。`crictl` 直接和节点上的 containerd 说话，是节点侧排障的主力：
+
+```bash
+# crictl 需要指定 endpoint，或者写进 /etc/crictl.yaml 一次配好
+cat > /etc/crictl.yaml <<'EOF'
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
+EOF
+
+crictl ps -a                       # 所有容器，含已退出的
+crictl pods                        # 所有 sandbox
+crictl logs <container-id>         # 容器日志（kubectl logs 拿不到时用）
+crictl inspect <container-id>      # 完整配置：cgroup 路径、挂载、环境变量、PID
+crictl images                      # 节点上的镜像
+crictl imagefsinfo                 # 镜像占用的磁盘
+crictl stats                       # 实时资源占用
+```
+
+<Callout type="tip" title="别用 ctr，用 crictl">
+containerd 自带的 `ctr` 也能操作容器，但它**不认 namespace**。K8s 的容器都在 `k8s.io` 这个 containerd namespace 下，`ctr` 默认看的是 `default`，所以 `ctr containers ls` 常常什么都不显示。
+
+真要用 `ctr`，得显式带上：`ctr -n k8s.io containers ls`。日常还是用 `crictl` —— 它是照 CRI 语义设计的，输出和 kubectl 对得上。
+</Callout>
+
+## cgroup 驱动必须两边一致
+
+kubelet 和 containerd 都要往 cgroup 里写限制，两者必须用同一个驱动。不一致的后果是资源限制静默失效或容器起不来。
+
+```bash
+# containerd 侧：/etc/containerd/config.toml
+# runc.options 里的 SystemdCgroup（这个文件里通常有多处，要全改）
+grep -n SystemdCgroup /etc/containerd/config.toml
+```
+
+kubespray 里对应一个变量：
+
+```yaml
+# inventory/mycluster/group_vars/all/containerd.yml
+containerd_use_systemd_cgroup: true    # 默认 true，即 systemd 驱动
+```
+
+> 从 K8s 1.31 起 kubelet 会自动探测 CRI 的 cgroup 驱动，后续版本会废弃 kubelet 的 `cgroupDriver` 参数 —— 也就是说 1.31 之后不需要在 kubelet 侧再配一遍了。
+
+<Callout type="trap" title="systemctl daemon-reload 会让 GPU Pod 失去设备权限">
+这是一个真实踩过的坑，现象非常迷惑：GPU Pod 跑得好好的，在宿主机上执行了一次 `systemctl daemon-reload`，Pod 里 `nvidia-smi` 就开始报 `Failed to initialize NVML: Unknown Error`。
+
+原因：systemd cgroup 驱动下，`daemon-reload` 会重建容器的 cgroup，导致容器丢失 NVIDIA 设备的访问权限。
+
+关键在于**哪些 Pod 会中招**：正常用 `resources.limits.nvidia.com/gpu` 申请 GPU 的 Pod 不会 —— gpu-operator 从 22.9.2 起通过注入设备软链接解决了。中招的是那种**不申请 GPU 资源、直接设 `NVIDIA_VISIBLE_DEVICES=all`** 的 Pod，它走不到那段修复逻辑。
+
+短期方案是把 containerd 切成 `cgroupfs` 驱动（`containerd_use_systemd_cgroup: false`，gpu-operator 的 `nvidia-container-toolkit-daemonset` 会读这个设置去配 nvidia runtime）。长期方案是用 DRA 做跨 Pod 的 GPU 共享。
+
+**更省事的做法是从规范入手**：要求所有 GPU Pod 必须用 `resources.limits` 申请卡，禁止 `NVIDIA_VISIBLE_DEVICES=all`。这条规范本身还顺带解决了 GPU 资源被超卖的问题。
+</Callout>
+
+## 镜像拉取失败的四类原因
+
+`ImagePullBackOff` 是最常见的故障之一，原因就那么几类，按这个顺序查最快：
+
+| 类型 | describe 里的报错特征 | 查什么 |
+| --- | --- | --- |
+| 镜像不存在 | `manifest unknown` / `not found` | 镜像名和 tag 拼写、仓库里到底有没有 |
+| 认证失败 | `unauthorized` / `authentication required` | `imagePullSecrets`、containerd 的 registry 配置 |
+| 网络不通 | `dial tcp ... i/o timeout` | 节点到仓库的连通性、代理、DNS |
+| 证书问题 | `x509: certificate signed by unknown authority` | 私有仓库的 CA 是否装到节点上 |
+
+```bash
+# 绕开 K8s，直接在节点上验证 —— 能立刻区分「集群配置问题」和「节点到仓库的问题」
+crictl pull <image>
+```
+
+<Quiz
+  id="cri-1"
+  question="一个 Pod 卡在 ContainerCreating，describe 显示 FailedCreatePodSandBox。下面哪个排查方向最对？"
+  options={[
+    { text: '查 CNI 插件的状态与节点上的 IP 地址池', correct: true },
+    { text: '查业务镜像能不能拉下来', feedback: 'sandbox 用的是 pause 镜像，业务镜像要等 sandbox 建好之后才拉。这个阶段还没轮到它。' },
+    { text: '查业务容器的启动命令写错没', feedback: '容器都还没创建，命令行还没被执行到。' },
+    { text: '查 etcd 是否健康', feedback: 'Pod 对象已经写进 etcd 并被 kubelet 拿到了，说明控制面链路是通的。' },
+  ]}
+  explain={<>sandbox 就是 pause 容器，它的核心职责是持有 network namespace，而这个 namespace 的网络是 CNI 插件配置的。所以 <code>FailedCreatePodSandBox</code> 几乎总是指向 CNI：插件 Pod 没起来、<code>/etc/cni/net.d/</code> 配置有问题，或者 IP 池耗尽。业务镜像和启动命令都是更后面的阶段。</>}
+/>
+
+## 这一节的落点
+
+- kubelet → CRI → containerd → shim → runc，**四段链路，排障先定位在哪一段**
+- pause 容器持有 namespace，所以业务容器重启 Pod IP 不变，`FailedCreatePodSandBox` 指向 CNI
+- 节点侧用 `crictl`（不是 `ctr`），kubectl 不可用时它是唯一的抓手
+- cgroup 驱动两边必须一致；GPU Pod 必须用 `resources.limits` 申请卡，别用 `NVIDIA_VISIBLE_DEVICES=all`
+- `crictl pull` 能一步区分「集群配置问题」和「节点到仓库的问题」

@@ -107,7 +107,7 @@ export const tracks: Track[] = [
         title: '运行时与 CRI：kubelet 底下发生了什么',
         summary: 'kubelet 自己不会跑容器，它通过 CRI 指挥 containerd。这条链路断在哪，节点就 NotReady 在哪。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '画出 kubelet → CRI → containerd → runc 的完整调用链',
@@ -128,7 +128,7 @@ export const tracks: Track[] = [
         title: '节点 OS 基线：装 K8s 之前要改的那些参数',
         summary: '内核参数、cgroup 驱动、时间同步、swap —— 这些没对齐，集群会以各种诡异的方式间歇性出问题。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '给一台新机器跑完上线前的 OS 检查清单',
@@ -191,7 +191,7 @@ export const tracks: Track[] = [
         title: '硬件与拓扑：控制面、计算节点与 GPU 机型',
         summary: '同样是「三台管理节点 + 若干计算节点」，配错 CPU、网卡或盘位，跑起来的差距是数量级的。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '给控制面、CPU 计算、GPU 计算三类节点各开一份合理配置',
@@ -250,7 +250,7 @@ export const tracks: Track[] = [
         title: '声明式模型与控制器循环',
         summary: '理解 reconcile，就理解了 K8s 的全部脾气：它不执行命令，它只是不停地把现状拉向期望。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '解释期望态 / 实际态 / reconcile 三者的关系',
@@ -272,7 +272,7 @@ export const tracks: Track[] = [
         title: '工作负载对象：Deployment 到 StatefulSet',
         summary: '选错工作负载类型，后面所有的滚动更新、扩缩容和存储绑定都会别扭。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '给定一个业务形态，选出合适的工作负载类型并说明理由',
@@ -294,7 +294,7 @@ export const tracks: Track[] = [
         title: '调度器：Pod 为什么落在这台节点上',
         summary: 'requests 决定调度，limits 决定运行。这两个字段配错，集群要么调不满，要么一压就崩。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '区分 requests 与 limits 的作用时机，说清三种 QoS 的驱逐顺序',
@@ -316,7 +316,7 @@ export const tracks: Track[] = [
         title: 'kubelet 与 Pod 生命周期：探针、驱逐与预留',
         summary: 'CrashLoopBackOff、Evicted、ContainerCreating —— 这三个状态背后是 kubelet 的三套完全不同的逻辑。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '正确配置 startup / liveness / readiness 三种探针，避免自杀式重启',
@@ -338,7 +338,7 @@ export const tracks: Track[] = [
         title: 'K8s 网络模型：Pod IP、Service 与 DNS',
         summary: '「每个 Pod 一个可路由 IP」这条约定，是理解 Service、CNI 和所有网络故障的起点。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '说出 K8s 网络模型的三条基本约定，以及 CNI 负责实现哪一部分',
@@ -360,7 +360,7 @@ export const tracks: Track[] = [
         title: '认证、授权与 ServiceAccount',
         summary: '谁能动这个集群、能动到什么程度 —— 交付前必须回答清楚，交付后再补就是一场大手术。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '区分认证与授权两个阶段，说清用户和 ServiceAccount 的不同来源',
@@ -397,7 +397,7 @@ export const tracks: Track[] = [
         title: '用 kubespray 装出第一套集群',
         summary: '不是 kubeadm 敲一遍就完事：inventory 怎么写、离线源怎么配、装完先验什么。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 45,
         objectives: [
           '按规划写出 inventory.ini 与 group_vars，跑完一次完整部署',
@@ -419,7 +419,7 @@ export const tracks: Track[] = [
         title: '把规划写进配置：group_vars 逐项拆解',
         summary: '同一份 playbook，配置写法决定了集群是能用两年还是三个月后推倒重来。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '逐项解释 k8s-cluster.yml 里影响长期运维的关键变量',
@@ -441,7 +441,7 @@ export const tracks: Track[] = [
         title: '客户端工具箱：kubectl、kustomize、helm',
         summary: '手上快十倍靠的不是记命令，是把 kubectl 输出、kustomize 分层和 helm 发布用在对的地方。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '用 -o jsonpath、--sort-by、events 等把 kubectl 用出调查工具的样子',
@@ -463,7 +463,7 @@ export const tracks: Track[] = [
         title: '节点生命周期：加入、维护、下线',
         summary: 'cordon、drain、delete 三步之间的差别，决定了一次夜间维护是平稳还是事故。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '安全地把一台节点摘出集群做维护，再原样放回去',
@@ -484,7 +484,7 @@ export const tracks: Track[] = [
         title: '控制面扩缩与证书轮转',
         summary: '3 台变 5 台、换掉一台坏掉的管理节点、证书还有 30 天到期 —— 都是不能试错的操作。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '在不中断服务的前提下增删一台控制面节点',
@@ -505,7 +505,7 @@ export const tracks: Track[] = [
         title: '集群升级：版本偏差与回滚预案',
         summary: '升级本身不难，难的是升到一半发现回不去。先把回滚路径想清楚再动手。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 40,
         objectives: [
           '查清目标版本的 API 弃用项与组件版本偏差约束',
@@ -526,7 +526,7 @@ export const tracks: Track[] = [
         title: 'etcd 运维：备份、恢复与碎片整理',
         summary: '集群其它东西都能重建，etcd 不能。这一节练的是「真的能恢复」，不是「有备份」。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '做一次快照备份，并在测试环境完整恢复出集群',
@@ -548,7 +548,7 @@ export const tracks: Track[] = [
         title: '闯关：一台节点变成 NotReady',
         summary: '在模拟终端里接手一台刚刚失联的节点，从现象一路追到根因。',
         kind: 'quest',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '按固定顺序收敛 NotReady 的可能原因，而不是随机试',
@@ -584,7 +584,7 @@ export const tracks: Track[] = [
         title: 'CNI 与 Cilium：eBPF 数据面',
         summary: 'CNI 选型是集群建成后最难改的决定之一。这一节把 Cilium 的能力边界讲清楚再动手装。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 40,
         objectives: [
           '说清主流 CNI 的差异，给出选型理由而不是只报名字',
@@ -605,7 +605,7 @@ export const tracks: Track[] = [
         title: '把服务暴露出去：MetalLB、Ingress 与 Gateway API',
         summary: '私有集群没有云厂商的 LB，LoadBalancer 那个 IP 得你自己变出来。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '用 MetalLB 给 LoadBalancer 类型的 Service 分配可路由 IP',
@@ -630,7 +630,7 @@ export const tracks: Track[] = [
         title: '网络策略与多租户隔离',
         summary: '默认全通的集群，一个租户的 Pod 可以直接连另一个租户的数据库。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '写出默认拒绝 + 按需放行的 NetworkPolicy 组合',
@@ -673,7 +673,7 @@ export const tracks: Track[] = [
         title: '接入后端存储：ceph-csi、gpfs-csi 与快照',
         summary: '把已有的 Ceph 或 GPFS 接进集群，跑通动态供应、扩容和快照这三件事。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 40,
         objectives: [
           '部署一个 CSI 驱动并创建可用的 StorageClass',
@@ -720,7 +720,7 @@ export const tracks: Track[] = [
         title: '可观测性：指标、日志与该盯的那几个数',
         summary: '监控装了一堆面板，出事时还是不知道看哪个 —— 因为没先定义「什么算不正常」。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 40,
         objectives: [
           '部署 VictoriaMetrics 与日志采集，把集群指标收上来',
@@ -742,7 +742,7 @@ export const tracks: Track[] = [
         title: '镜像仓库与分发：Harbor、Spegel 与离线源',
         summary: '几百个节点同时拉一个 10G 的镜像，仓库和网络会先倒下。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '搭出一套私有镜像仓库并接入集群的拉取凭据',
@@ -779,7 +779,7 @@ export const tracks: Track[] = [
         title: 'GPU 节点：GPU Operator、设备插件与拓扑',
         summary: '把一台插了八张卡的机器变成集群里可调度的 GPU 节点，比装个驱动复杂得多。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 40,
         objectives: [
           '用 GPU Operator 完成驱动、容器运行时与设备插件的全套部署',
@@ -801,7 +801,7 @@ export const tracks: Track[] = [
         title: 'AI 负载调度：Volcano、Kueue 与 gang scheduling',
         summary: '默认调度器一个一个放 Pod，分布式训练要么全起要么别起 —— 这就是要换调度器的原因。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 40,
         objectives: [
           '解释 gang scheduling 解决的死锁问题，以及默认调度器为什么做不到',
@@ -813,8 +813,8 @@ export const tracks: Track[] = [
           'gang / co-scheduling 的实现思路',
           'Volcano：队列、作业与插件',
           'Kueue：配额借用与准入排队',
-          'scheduler-plugins：最小侵入的选择',
-          '三者对比与选型建议',
+          '为什么弃用 Coscheduling：资源不足时的调度风暴',
+          '两者对比、致命的 webhook 冲突与原生 gang 的演进路线',
         ],
         refs: [repo('ai/scheduling-comparison.md'), repo('ai/volcano/README.md'), repo('ai/kueue/README.md')],
       },
@@ -823,7 +823,7 @@ export const tracks: Track[] = [
         title: '训练与推理平台：Trainer、Ray 与 vLLM',
         summary: '平台交付给算法团队的不是节点，是「提交一个作业」和「上线一个模型」这两个动作。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '说清训练作业与推理服务对集群的不同要求',
@@ -845,7 +845,7 @@ export const tracks: Track[] = [
         title: '多租户与虚拟集群：Kamaji、vcluster、k3k',
         summary: '「每个团队一套集群」和「所有团队一套集群」之间，还有一整排折中方案。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '在命名空间隔离、虚拟集群、独立集群之间给出选型理由',
@@ -888,7 +888,7 @@ export const tracks: Track[] = [
         title: '规模化：apiserver 过载与大集群的限额',
         summary: '几十台的时候一切正常，几百台之后 list 一次 Pod 就能把控制面拖垮。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '定位 apiserver 压力来源：谁在 list、谁在 watch',
@@ -910,7 +910,7 @@ export const tracks: Track[] = [
         title: '值班手册与变更管理',
         summary: '把排查过程固化成 SOP，把每次事故变成一条检查项 —— 这是运维团队唯一的复利。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '为常见告警写出可直接执行的处置 SOP',

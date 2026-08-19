@@ -1,0 +1,241 @@
+默认情况下，集群里任意一个 Pod 都能连上任意另一个 Pod。
+
+也就是说，一个租户的测试容器可以直接连另一个租户的数据库 —— 只要它知道地址。而 Service 的 DNS 名是可枚举的。
+
+## NetworkPolicy 的语义
+
+三条规则，理解了就不会写错：
+
+```
+1. 一个 Pod 只要被任何 NetworkPolicy 选中，它就从「全通」变成「白名单」
+2. 多条策略是【并集】—— 任一条允许即允许，没有「拒绝」规则
+3. 策略分 Ingress（进）和 Egress（出）两个方向，各自独立
+```
+
+<Callout type="trap" title="没有「拒绝」规则，只有「不被允许」">
+NetworkPolicy 里**不存在 deny**。想禁止某个访问，做法是「不把它写进任何允许规则」。
+
+这带来一个反直觉的后果：**加一条策略只会让访问变多，不会变少**。所以「我加了策略限制它却还能通」通常是因为另一条策略允许了它。
+
+排查时要找的是「哪条策略允许了这个流量」，而不是「哪条策略应该拦住它」。
+</Callout>
+
+## 默认拒绝的正确写法
+
+多租户隔离的第一步，是给每个命名空间铺上默认拒绝：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: team-a
+spec:
+  podSelector: {}                  # 空选择器 = 命名空间内所有 Pod
+  policyTypes: [Ingress, Egress]   # 两个方向都管
+  # 注意：这里刻意不写任何 ingress/egress 规则 —— 即什么都不允许
+```
+
+然后按需放行：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-web-to-db
+  namespace: team-a
+spec:
+  podSelector:
+    matchLabels: { app: postgres }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: web }
+      ports:
+        - protocol: TCP
+          port: 5432
+```
+
+## 三个必踩的坑
+
+### 1. DNS 忘了放行
+
+```yaml
+# 默认拒绝 Egress 之后，Pod 连不上 CoreDNS —— 所有域名解析失败
+egress:
+  - to:
+      - namespaceSelector:
+          matchLabels: { kubernetes.io/metadata.name: kube-system }
+        podSelector:
+          matchLabels: { k8s-app: kube-dns }
+    ports:
+      - { protocol: UDP, port: 53 }
+      - { protocol: TCP, port: 53 }
+```
+
+<Callout type="warn" title="这是默认拒绝 Egress 之后的头号故障">
+现象是所有服务突然「找不到彼此」，日志里全是域名解析失败。而排查方向很容易被带偏到 CoreDNS 上 —— CoreDNS 本身完全健康，是策略把去它的流量挡了。
+
+**任何 default-deny-egress 都必须同时放行 DNS**。建议把 DNS 放行做成每个命名空间的标准配置模板，和 default-deny 一起下发。
+
+另外注意要放行 **UDP 和 TCP 两个 53** —— 响应超过 512 字节时 DNS 会回落到 TCP。
+</Callout>
+
+### 2. namespaceSelector 与 podSelector 的组合语义
+
+这是 YAML 结构上最容易写错的地方：
+
+```yaml
+# 写法 A：一个 from 元素里同时有两个 selector = 【与】
+#         「kube-system 命名空间里的 kube-dns Pod」
+- from:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+      podSelector: { matchLabels: { k8s-app: kube-dns } }
+
+# 写法 B：两个独立的 from 元素 = 【或】
+#         「kube-system 里的任意 Pod」或「任意命名空间里的 kube-dns Pod」
+- from:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+    - podSelector: { matchLabels: { k8s-app: kube-dns } }
+```
+
+差别只是一个 `-` 的位置，语义完全不同，而 B 的放行范围大得多。写完务必用 Hubble 或 `cilium policy trace` 验证实际效果。
+
+### 3. 跨命名空间需要两边都放行
+
+```
+team-a/web  →  team-b/api
+
+需要两条策略：
+  team-a 的 Egress 允许出到 team-b/api
+  team-b 的 Ingress 允许来自 team-a/web
+```
+
+只配一边不通。这是「明明配了策略还是不通」的常见原因，而且日志里只有一侧能看到丢包。
+
+## Cilium NetworkPolicy 与 L7
+
+原生 NetworkPolicy 只能做到 IP + 端口。Cilium 的 CRD 能到 HTTP 语义级别：
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: api-l7
+  namespace: team-b
+spec:
+  endpointSelector:
+    matchLabels: { app: api }
+  ingress:
+    - fromEndpoints:
+        - matchLabels: { app: web }
+      toPorts:
+        - ports: [{ port: "8080", protocol: TCP }]
+          rules:
+            http:
+              - method: GET
+                path: "/api/v1/.*"
+              - method: POST
+                path: "/api/v1/orders"
+              # 其它方法与路径一律拒绝
+```
+
+还有两个原生策略做不到的能力：
+
+```yaml
+  # 按 FQDN 放行出站 —— 而不是维护一堆会变的 IP
+  egress:
+    - toFQDNs:
+        - matchName: "registry.example.com"
+        - matchPattern: "*.githubusercontent.com"
+
+  # 按节点/实体放行
+    - toEntities: [host, kube-apiserver]
+```
+
+<Callout type="tip" title="toFQDNs 解决了「外部服务 IP 会变」的老问题">
+用原生 NetworkPolicy 放行「访问某个外部 API」只能写 `ipBlock`，而对方用了 CDN 或者换了机房，IP 一变策略就失效。
+
+`toFQDNs` 让 Cilium 拦截 DNS 响应、动态维护允许的 IP 集合。这是原生策略做不到的，也是很多团队最终选 Cilium 的原因之一。
+</Callout>
+
+## 验证策略：不要靠推理
+
+策略的交集很容易想错，一定要实测：
+
+```bash
+# 1. Hubble 直接看被丢弃的包，以及是哪条策略丢的
+hubble observe --verdict DROPPED --namespace team-a
+hubble observe --from-pod team-a/web --to-pod team-b/api
+
+# 2. 主动测试连通性
+kubectl -n team-a run probe --rm -it --image=nicolaka/netshoot -- \
+  nc -zv postgres.team-a.svc.cluster.local 5432
+
+# 3. Cilium 的策略追踪：给出判定过程
+kubectl -n kube-system exec ds/cilium -- \
+  cilium-dbg policy trace --src-k8s-pod team-a:web --dst-k8s-pod team-b:api --dport 8080
+```
+
+<Callout type="tip" title="hubble observe --verdict DROPPED 是最高效的入口">
+它直接给出「哪个源到哪个目标的哪个端口被丢了，以及是哪条策略的判定」。
+
+比起在几十条 YAML 里推算交集，这条命令通常几秒就能定位。生产集群上策略变更之后，用它看一遍 DROPPED 也是最快的回归验证。
+</Callout>
+
+## 隔离方案的选择
+
+NetworkPolicy 只是隔离手段之一，强度和成本要匹配需求：
+
+| 方案 | 隔离强度 | 成本 | 适合 |
+| --- | --- | --- | --- |
+| 只用命名空间 | **无网络隔离** | 零 | 互相信任的团队 |
+| Namespace + NetworkPolicy | 网络层隔离 | 低，但要维护策略 | 大多数多团队场景 |
+| + ResourceQuota + RBAC | 网络 + 资源 + 权限 | 中 | 平台化多租户 |
+| 虚拟集群（vcluster / Kamaji） | 控制面也隔离 | 中高 | 租户需要自己的 CRD 和集群级权限 |
+| 独立集群 | 完全隔离 | 高 | 合规要求、强不信任 |
+
+<Callout type="warn" title="NetworkPolicy 管不到的三件事">
+它只管 Pod 到 Pod 的网络流量。以下都不在它的范围内：
+
+1. **API 权限** —— 能不能读别人的 Secret，那是 RBAC 的事
+2. **资源抢占** —— 一个租户把节点 CPU 吃光，靠 ResourceQuota 和 QoS
+3. **内核层隔离** —— 容器共享内核，真正的强隔离需要 Kata Containers 这类方案
+
+所以「多租户隔离」是一套组合拳。只配 NetworkPolicy 就宣称隔离了，是不成立的 —— 这也是 L4《多租户与虚拟集群》要讨论隔离强度谱系的原因。
+</Callout>
+
+<Quiz
+  id="np-1"
+  question="给命名空间加了 default-deny-all（含 Egress）之后，所有服务都报域名解析失败。原因是？"
+  options={[
+    { text: '策略把去 CoreDNS 的流量也挡了，需要显式放行 UDP/TCP 53', correct: true },
+    { text: 'CoreDNS 挂了', feedback: 'CoreDNS 本身健康 —— 是策略挡住了 Pod 去访问它。这是最容易被带偏的方向。' },
+    { text: 'default-deny 不该同时管 Egress', feedback: '管 Egress 是对的，出向控制是防数据外泄的关键。要做的是补上 DNS 放行，而不是放弃 Egress 控制。' },
+    { text: 'NetworkPolicy 不支持 UDP', feedback: '支持，需要在 ports 里显式声明 protocol: UDP。' },
+  ]}
+  explain={<>这是 default-deny-egress 的头号故障。DNS 是集群里几乎所有通信的前置步骤，挡了它等于挡了一切。放行时要注意两点：<strong>UDP 和 TCP 都要放</strong>（响应超过 512 字节会回落到 TCP），以及选择器要正确指向 kube-system 里的 kube-dns Pod。建议把 DNS 放行和 default-deny 打包成一个标准模板一起下发。</>}
+/>
+
+<Quiz
+  id="np-2"
+  question="team-a/web 访问 team-b/api 不通，两个命名空间都有 default-deny。需要配几条策略？"
+  options={[
+    { text: '两条：team-a 的 Egress 放行，team-b 的 Ingress 放行', correct: true },
+    { text: '一条：在 team-b 配 Ingress 放行就够了', feedback: 'team-a 的 default-deny-egress 会挡住出站流量，包根本发不出去。' },
+    { text: '一条：在 team-a 配 Egress 放行就够了', feedback: '包能发出去，但会被 team-b 的 default-deny-ingress 挡在门口。' },
+    { text: '零条：同集群内的 Pod 默认互通', feedback: '在没有任何 NetworkPolicy 时是这样，但两边都已经有 default-deny 了。' },
+  ]}
+  explain={<>出向和入向是两个独立的判定点，各自由所在命名空间的策略控制。这是「明明配了策略还是不通」最常见的原因 —— 而且不好查，因为只有其中一侧的 Hubble 日志能看到丢包。用 <code>hubble observe --verdict DROPPED</code> 分别在两个命名空间看一遍，能立刻定位是哪一侧挡的。</>}
+/>
+
+## 这一节的落点
+
+- **没有 deny，只有「不被允许」**；加策略只会让访问变多
+- default-deny 之后**必须放行 DNS**（UDP + TCP 53），这是头号故障
+- `namespaceSelector` 与 `podSelector` 在同一个 `from` 元素里是**与**，分开是**或** —— 差一个 `-`
+- **跨命名空间要两边都放行**
+- Cilium 的 `toFQDNs` 解决外部服务 IP 会变的问题；L7 规则能到 HTTP 方法/路径级
+- 用 `hubble observe --verdict DROPPED` 验证，不要靠推理策略交集
+- NetworkPolicy 管不到 API 权限、资源抢占和内核隔离 —— 多租户是组合拳

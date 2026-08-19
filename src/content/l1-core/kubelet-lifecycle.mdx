@@ -1,0 +1,235 @@
+`CrashLoopBackOff`、`Evicted`、`ContainerCreating` —— 这三个状态在告警里长得差不多，背后却是 kubelet 的三套完全不同的逻辑。
+
+这一节的目标是：看到状态就知道去哪查，不用每次从头猜。
+
+## Pod 阶段与容器状态是两回事
+
+```
+Pod.status.phase        Pending → Running → Succeeded / Failed
+                        （粗粒度，只有五个值）
+
+Pod.status.containerStatuses[].state
+                        Waiting  { reason: ImagePullBackOff / CrashLoopBackOff ... }
+                        Running  { startedAt }
+                        Terminated { exitCode, reason: OOMKilled / Error ... }
+```
+
+**告警里看到的那些名字，基本都在 container 层，不在 Pod 层。** 所以排查要看容器状态，而不是停在 phase：
+
+```bash
+# 一眼看完所有容器的真实状态与退出码
+kubectl get pod web-0 -o jsonpath='{range .status.containerStatuses[*]}{.name}{"\t"}{.state}{"\n"}{end}'
+
+# 上一次退出的原因 —— CrashLoopBackOff 时最有用
+kubectl get pod web-0 -o jsonpath='{.status.containerStatuses[0].lastState.terminated}'
+kubectl logs web-0 --previous
+```
+
+<Callout type="tip" title="--previous 是排查 CrashLoop 的关键">
+`CrashLoopBackOff` 的 Pod 里，当前容器可能刚起来还没输出，或者正在 backoff 等待期。
+
+`kubectl logs --previous` 拿的是**上一个已退出容器**的日志 —— 那里才有崩溃时的堆栈。忘了加这个参数，是新人查 CrashLoop 最常卡住的地方。
+</Callout>
+
+## 三种探针，三种语义
+
+配错探针是「自己把自己搞挂」的头号原因：
+
+| 探针 | 失败后果 | 用来回答 |
+| --- | --- | --- |
+| **startupProbe** | 继续等，不算失败 | 「启动完了吗」 |
+| **livenessProbe** | **重启容器** | 「还活着吗」 |
+| **readinessProbe** | 从 Service 摘掉，不重启 | 「能接流量吗」 |
+
+```yaml
+startupProbe:                    # 启动慢的应用必须配这个
+  httpGet: { path: /healthz, port: 8080 }
+  failureThreshold: 30
+  periodSeconds: 10              # 最多容忍 300 秒启动时间
+
+livenessProbe:
+  httpGet: { path: /healthz, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 3            # 30 秒确认死亡才重启
+
+readinessProbe:
+  httpGet: { path: /ready, port: 8080 }
+  periodSeconds: 5
+  failureThreshold: 2
+```
+
+<Callout type="trap" title="liveness 探针配错，会把慢启动变成无限重启">
+最典型的事故：应用启动需要 90 秒（加载模型、预热连接池），而 `livenessProbe` 配了 `initialDelaySeconds: 30` + `failureThreshold: 3` + `periodSeconds: 10`。
+
+于是 60 秒时探针判定死亡 → 重启 → 又要 90 秒 → 又在 60 秒被杀。**永远起不来，而且日志里看不出任何应用错误**，只看到反复重启。
+
+两条规则可以避免：
+
+1. **启动慢的应用一律配 `startupProbe`** —— 它通过之前 liveness 不生效，这就是它存在的意义
+2. **liveness 的检查逻辑要极简** —— 只答「进程还能响应吗」。千万别在 liveness 里检查数据库连通性：数据库抖一下，所有副本一起被重启，把局部故障放大成全面雪崩
+
+**readiness 里可以查依赖**（摘流量是对的），**liveness 里绝对不行**（重启解决不了别人的故障）。
+</Callout>
+
+## 节点资源预留与驱逐阈值
+
+L4 的容量计算器算的就是这一层：
+
+```
+Capacity（节点物理规格）
+  − system-reserved      给 sshd、systemd 等系统进程
+  − kube-reserved        给 kubelet、containerd
+  − eviction-threshold   驱逐缓冲，默认 memory.available<100Mi
+  ────────────────────
+  = Allocatable          调度器能分配的部分
+```
+
+```bash
+kubectl describe node gn-10-128-1-1 | sed -n '/Capacity/,/Allocated/p'
+```
+
+kubelet 侧对应的配置：
+
+```yaml
+# /var/lib/kubelet/config.yaml
+kubeReserved:   { cpu: 500m, memory: 1Gi, ephemeral-storage: 10Gi }
+systemReserved: { cpu: 500m, memory: 1Gi }
+evictionHard:
+  memory.available: "500Mi"
+  nodefs.available: "10%"
+  imagefs.available: "15%"
+```
+
+### 驱逐的顺序
+
+节点资源紧张时，kubelet 按这个顺序挑 Pod 下手：
+
+1. **超出自己 requests 最多的** 优先
+2. 同等条件下按 QoS：**BestEffort → Burstable → Guaranteed**
+3. 同 QoS 内按优先级（PriorityClass）
+
+所以「设了 requests 的 Pod 更安全」不是一句空话，它直接决定了驱逐名单的顺序。
+
+<Callout type="warn" title="OOMKilled 与 Evicted 是两个完全不同的机制">
+这两个经常被混为一谈，但排查方向完全不同：
+
+| | 谁执行 | 触发条件 | 现象 |
+| --- | --- | --- | --- |
+| **OOMKilled** | **内核** | 容器用量超过自己的 `limits.memory` | 容器被杀并按 restartPolicy 重启，Pod 还在原节点 |
+| **Evicted** | **kubelet** | **节点整体**内存/磁盘不足 | Pod 被删除，在别的节点重建 |
+
+判断方法：`OOMKilled` 出现在容器的 `lastState.terminated.reason` 里；`Evicted` 是 Pod 层的 status，`describe` 里能看到 kubelet 发的驱逐事件。
+
+- 看到 OOMKilled → 查这个容器的 limits 和它的实际用量
+- 看到 Evicted → 查**节点**的资源水位和预留配置，问题不在这个 Pod
+</Callout>
+
+### 磁盘驱逐：容易忽略的那一类
+
+内存驱逐人人都知道，磁盘驱逐常被忽略，但它在生产上更频繁：
+
+```bash
+# 节点上的三个磁盘大户
+du -sh /var/lib/containerd     # 镜像层
+du -sh /var/log/pods           # 容器日志
+du -sh /var/lib/kubelet/pods   # emptyDir、投射卷
+```
+
+`nodefs.available` 低于阈值时，kubelet 会先尝试回收（删无用镜像、清日志），不够再驱逐 Pod。表现是**一批 Pod 莫名其妙集体迁走**。
+
+预防措施：限制容器日志大小（containerd 的 `max_size` / `max_file`），给 emptyDir 加 `sizeLimit`，并把镜像目录放到单独的盘。
+
+## 优雅终止的完整时序
+
+```
+kubectl delete pod web-0
+  │
+  ├─ apiserver 打上 deletionTimestamp
+  │
+  ├─ 【并行发生，这是关键】
+  │   ├─ endpoints 控制器把 Pod 从 Service 摘掉（需要时间传播到每个节点的 kube-proxy）
+  │   └─ kubelet 执行 preStop hook，然后发 SIGTERM
+  │
+  ├─ 等待 terminationGracePeriodSeconds（默认 30s）
+  │
+  └─ 还没退出 → SIGKILL
+```
+
+<Callout type="trap" title="摘流量和发 SIGTERM 是并行的，不是先后的">
+这是「滚动更新为什么还是丢请求」的根本原因。
+
+Service 摘除是异步的：endpoints 控制器更新 → 每个节点的 kube-proxy 收到变更 → 更新 iptables/eBPF 规则。这个链路要几百毫秒甚至几秒。而 SIGTERM 是**同时**发出的。
+
+于是有一个窗口：应用已经开始关闭，流量还在进来 → 502。
+
+标准解法是加一个 preStop 的睡眠，把关闭动作往后推：
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["sh", "-c", "sleep 5"]
+terminationGracePeriodSeconds: 60   # 必须大于 sleep + 实际处理时间
+```
+这 5 秒什么都不干，就是等 Service 摘除传播完。看起来很土，但这是社区的通行做法。
+
+另外别忘了 L0 讲的 PID 1 问题：应用不处理 SIGTERM 的话，这套时序里的每一步都是白费 —— 它会一直活到 30 秒后被 SIGKILL。
+</Callout>
+
+## 按状态选排查入口
+
+把这一节压成一张值班用的表：
+
+| 状态 | 含义 | 先看什么 |
+| --- | --- | --- |
+| `Pending` + 无 nodeName | 调度没通过 | `describe pod` 的节点淘汰统计 |
+| `Pending` + 有 nodeName | 卷挂载或 sandbox 卡住 | 该节点 kubelet 日志、CSI node plugin |
+| `ContainerCreating` | 拉镜像 / 建 sandbox / 挂卷 | `describe` Events；`FailedCreatePodSandBox` → CNI |
+| `ImagePullBackOff` | 镜像拉不下来 | 镜像名、`imagePullSecrets`；节点上 `crictl pull` 验证 |
+| `CrashLoopBackOff` | 容器反复退出 | `logs --previous` + `lastState.terminated.exitCode` |
+| `OOMKilled` | 超了自己的内存 limits | 这个容器的 limits 与实际用量 |
+| `Evicted` | **节点**资源不足 | 节点水位、预留配置、磁盘占用 |
+| `Terminating` 卡住 | finalizer 或进程不退 | finalizer、`terminationGracePeriod`、SIGTERM 处理 |
+| `Running` 但不接流量 | readiness 没过 | `describe` 里的 readiness 探针事件 |
+
+退出码也有固定含义：
+
+| exitCode | 含义 |
+| --- | --- |
+| 0 | 正常退出 |
+| 1 / 2 | 应用自己报错 |
+| 137 | 128+9，被 SIGKILL —— OOMKilled 或优雅期超时 |
+| 143 | 128+15，被 SIGTERM 正常终止 |
+
+<Quiz
+  id="kubelet-1"
+  question="一个加载大模型的推理服务需要 3 分钟启动。探针该怎么配？"
+  options={[
+    { text: '配 startupProbe 容忍 3 分钟以上，liveness 保持简单快速', correct: true },
+    { text: 'livenessProbe 的 initialDelaySeconds 设成 200', feedback: '能凑效，但把「启动多久」硬编码进了延迟值 —— 机器慢一点或模型变大就又崩。startupProbe 是专为此设计的，它按实际就绪时间自适应。' },
+    { text: '不配 livenessProbe，只配 readinessProbe', feedback: '那么进程假死（端口在监听但不响应）时没人能救它，会一直挂在集群里占着资源。' },
+    { text: '把 failureThreshold 调到 100', feedback: '这让 liveness 在运行期形同虚设 —— 真死了要 100 个周期才发现。启动期和运行期应该用不同的探针分开管。' },
+  ]}
+  explain={<><code>startupProbe</code> 的作用就是把「启动期」和「运行期」分开：它通过之前 liveness 完全不生效，通过之后 liveness 立刻按正常的严格参数工作。这样既能容忍 3 分钟的冷启动，又能在运行期 30 秒内发现假死 —— 用 <code>initialDelaySeconds</code> 是做不到两者兼顾的。</>}
+/>
+
+<Quiz
+  id="kubelet-2"
+  question="一个节点上十几个 Pod 同时变成 Evicted。最该查什么？"
+  options={[
+    { text: '这个节点的内存与磁盘水位，以及 kubelet 的预留和驱逐阈值配置', correct: true },
+    { text: '这些 Pod 各自的 memory limits', feedback: '超自己 limits 是 OOMKilled（单个容器被杀，Pod 留在原节点）。集体 Evicted 是节点级别的资源不足。' },
+    { text: '调度器的配置', feedback: '驱逐由节点上的 kubelet 执行，与调度器无关。调度器负责的是之后把这些 Pod 放到别处。' },
+    { text: 'apiserver 的负载', feedback: '控制面压力不会触发节点驱逐。' },
+  ]}
+  explain={<>「同一节点上多个 Pod 同时 Evicted」是节点级资源压力的典型信号 —— 而且很可能是<strong>磁盘</strong>而不是内存：<code>/var/lib/containerd</code>（镜像层）或 <code>/var/log/pods</code>（容器日志）涨满，触发 <code>nodefs.available</code> 阈值。内存驱逐通常一次只带走一两个（杀掉超额最多的就够了），磁盘驱逐往往是成批的。</>}
+/>
+
+## 这一节的落点
+
+- 告警里的名字大多在**容器层**，不是 Pod 层；`logs --previous` 是查 CrashLoop 的关键
+- **liveness 只查自己活着没，绝不查依赖** —— 否则局部故障会被放大成雪崩；慢启动一律用 startupProbe
+- **OOMKilled 查这个容器的 limits，Evicted 查节点的水位** —— 两个完全不同的机制
+- 磁盘驱逐比内存驱逐更常见，且往往成批发生；限制容器日志、给 emptyDir 加 sizeLimit
+- 摘流量与 SIGTERM 是**并行**的，无损下线需要 preStop sleep + 足够的优雅期 + 应用真的处理 SIGTERM
+- 退出码 137 = 被 SIGKILL，143 = 被 SIGTERM

@@ -1,0 +1,266 @@
+平台交付给算法团队的不是节点，是两个动作：**提交一个训练作业**，和**上线一个模型**。
+
+这两个动作对集群的要求几乎相反，所以要分开设计。
+
+## 训练与推理的诉求对比
+
+| | 训练作业 | 推理服务 |
+| --- | --- | --- |
+| 生命周期 | 跑完就退出（Job 语义） | 长期运行（Deployment 语义） |
+| 调度要求 | **all-or-nothing**，需要 gang scheduling | 逐个扩容即可 |
+| 失败处理 | 从 checkpoint 重启 | 重建副本，流量摘走 |
+| 网络 | **多机通信是瓶颈**，需要 RDMA | 请求小，以太网够 |
+| 存储 | 大吞吐顺序读（数据集）+ 定期写 checkpoint | 启动时读一次模型权重 |
+| 弹性 | 固定规模，中途不变 | 按 QPS 伸缩 |
+| 每卡 CPU | 8–16 核（数据预处理） | 4–8 核 |
+
+理解了这张表，后面选什么组件就是自然结论。
+
+## 训练：作业编排
+
+### Kubeflow Trainer
+
+当前主流选择，配合 L4《AI 负载调度》里的 Kueue 使用：
+
+```yaml
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: llama-sft
+  labels:
+    kueue.x-k8s.io/queue-name: gpu-local-queue
+spec:
+  suspend: true                     # 交给 Kueue 决定何时放行
+  runtimeRef:
+    name: torch-distributed         # 预置的 runtime，封装了 torchrun 的启动方式
+  trainer:
+    numNodes: 4
+    resourcesPerNode:
+      requests:
+        nvidia.com/gpu: "8"
+        cpu: "96"
+        memory: "1024Gi"
+```
+
+`runtimeRef` 是关键设计：平台团队预置好 `torch-distributed`、`deepspeed` 这些 runtime，封装了进程启动、环境变量、RANK 分配的细节。算法团队只填节点数和资源，不用关心 `MASTER_ADDR` 怎么来的。
+
+### KubeRay
+
+Ray 生态的场景（强化学习、超参搜索、数据处理流水线）：
+
+| 对象 | 用途 |
+| --- | --- |
+| `RayCluster` | 长期存在的集群，交互式开发用 |
+| `RayJob` | 提交一次任务，跑完自动清理集群 |
+| `RayService` | 推理服务，带滚动升级 |
+
+```yaml
+apiVersion: ray.io/v1
+kind: RayJob
+spec:
+  entrypoint: python train.py
+  shutdownAfterJobFinishes: true     # 跑完回收资源，别让集群空占卡
+  rayClusterSpec:
+    headGroupSpec: { ... }
+    workerGroupSpecs:
+      - replicas: 4
+        template:
+          spec:
+            containers:
+              - resources: { limits: { nvidia.com/gpu: 8 } }
+```
+
+<Callout type="warn" title="RayCluster 忘了回收是 GPU 集群最常见的浪费">
+交互式开发用 `RayCluster` 很方便，但它**不会自己消失**。一个占了 32 张卡的 RayCluster，开发的人下班走了，卡就一直占着。
+
+两个措施：
+
+1. 训练任务一律用 `RayJob` + `shutdownAfterJobFinishes: true`
+2. 交互式 `RayCluster` 强制配 TTL 或 idle 超时回收（Ray 的 autoscaler 支持 `idleTimeoutSeconds`）
+
+配合监控上一个「GPU 已分配但利用率长期为 0」的看板，能把这类浪费找出来。
+</Callout>
+
+### 环境变量与网络绑定
+
+多机训练性能不达标，很多时候是这几个变量没配对（对应 L0《硬件与拓扑》的拓扑问题）：
+
+```yaml
+env:
+  - name: NCCL_IB_HCA
+    value: "mlx5_0,mlx5_1"           # 指定用哪些 RDMA 网卡，要与 GPU 的 NUMA 配对
+  - name: NCCL_SOCKET_IFNAME
+    value: "eth0"                    # 控制面通信走哪张网卡
+  - name: NCCL_DEBUG
+    value: "INFO"                    # 排障时开，会打印实际选用的传输路径
+  - name: NCCL_IB_DISABLE
+    value: "0"
+```
+
+`NCCL_DEBUG=INFO` 的输出里会明确写出 NCCL 选择了什么传输方式（NVLink / IB / SHM / TCP）。**如果预期走 IB 却显示 TCP，就是网卡没被正确识别或绑定** —— 这是排查多机训练慢的第一站。
+
+## 推理：三个层次
+
+### 单机单卡：普通 Deployment
+
+模型能装进一张卡（7B 以下），最简单：
+
+```yaml
+spec:
+  replicas: 4
+  template:
+    spec:
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          args: ["--model", "/models/qwen2.5-7b", "--gpu-memory-utilization", "0.9"]
+          resources: { limits: { nvidia.com/gpu: 1 } }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: model-repo }   # RWX，多副本共享
+```
+
+注意模型仓库必须是 **RWX** 卷（CephFS / GPFS，见 L3《存储接入》）—— 多个副本要同时读同一份权重。
+
+### 单机多卡：张量并行
+
+70B 级模型需要多卡：
+
+```yaml
+args: ["--model", "/models/qwen2.5-72b", "--tensor-parallel-size", "8"]
+resources: { limits: { nvidia.com/gpu: 8 } }
+```
+
+一个 Pod 拿 8 张卡，`tensor-parallel-size` 与卡数一致。仍然是普通 Deployment，因为不跨节点。
+
+### 跨节点：LeaderWorkerSet
+
+DeepSeek V3/R1 671B 这类模型单机装不下，需要跨节点部署 —— 而这打破了 Deployment 的模型：多个 Pod 要作为**一个推理实例**协同工作。
+
+**LWS（LeaderWorkerSet）** 就是为此设计的：
+
+```yaml
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata: { name: deepseek-r1 }
+spec:
+  replicas: 2                      # 两个完整的推理实例
+  leaderWorkerTemplate:
+    size: 4                        # 每个实例 4 个 Pod（1 leader + 3 worker）
+    leaderTemplate: { ... }
+    workerTemplate: { ... }
+```
+
+<Callout type="note" title="LWS 解决的是「一个服务实例由多个 Pod 组成」">
+普通 Deployment 的假设是「每个 Pod 是一个独立且等价的副本」。跨节点推理打破了这个假设：4 个 Pod 一起才构成一个能服务请求的实例，而且它们之间有 leader / worker 的角色分工。
+
+LWS 提供三样 Deployment 给不了的东西：
+
+1. **组内固定的拓扑与角色** —— leader 知道自己是 leader，worker 知道去连哪个 leader
+2. **整组一起伸缩** —— 扩容是「+1 个完整实例（4 个 Pod）」，不是「+1 个 Pod」
+3. **整组一起滚动升级** —— 不会出现半新半旧的实例
+
+这和训练的 gang scheduling 是同一类问题在推理侧的体现。
+</Callout>
+
+### llm-d 与推理网关
+
+规模再大就需要专门的路由层。普通的 Service 负载均衡对 LLM 推理是低效的 —— 它不知道每个副本的 KV cache 状态和排队情况。
+
+```
+客户端
+  ↓
+推理网关（Gateway API + inference extension）
+  ├─ 按 KV cache 命中率路由：同一会话的请求送到有缓存的副本
+  ├─ 按队列深度做负载感知
+  └─ Prefill / Decode 分离调度（P/D 分离）
+  ↓
+vLLM 副本组
+```
+
+`llm-d` 提供的就是这一套（基于 vLLM 的分布式推理 + 智能路由）。它的收益在高并发、长上下文场景下很明显，因为 **KV cache 命中能省掉大量重复计算**。
+
+## 存储与网络对性能的影响
+
+这是最容易被忽略、但影响最大的一环：
+
+| 环节 | 需求 | 配错的表现 |
+| --- | --- | --- |
+| 训练数据集读取 | 大吞吐顺序读，RWX | GPU 利用率忽高忽低（在等数据） |
+| checkpoint 写入 | 突发大写入 | 写 checkpoint 时训练暂停很久 |
+| 模型权重加载 | 一次性大读 | 推理服务启动要几分钟 |
+| 多机通信 | RDMA 低延迟 | AllReduce 占比过高 |
+
+<Callout type="tip" title="GPU 利用率波动 = 数据管道有瓶颈">
+`nvidia-smi` 或 dcgm 指标里 GPU 利用率在 30% 和 100% 之间反复跳，几乎总是数据管道跟不上：
+
+1. **存储吞吐不够** —— 用 `elbencho` 实测数据集所在存储的读带宽
+2. **CPU 不够做预处理** —— 对照 L0 的经验值：每卡 8–16 核
+3. **DataLoader 的 worker 数太少** —— 应用侧参数
+
+三者要一起看。只加卡不解决数据管道，加的卡也是在等数据。
+
+模型权重加载慢则是另一类问题：几十上百 GB 的权重，所有推理副本同时从存储拉。这时候用 L3《镜像仓库与分发》讲的 Dragonfly 做 P2P 分发，比堆存储带宽划算得多。
+</Callout>
+
+## 基准测试：交付前必做
+
+```bash
+# 1. nvbandwidth：Host↔Device 与 Device↔Device 带宽
+#    验证 PCIe 通道数与 NVLink 是否真的生效
+
+# 2. nccl-tests：多机 AllReduce
+#    验证 RDMA、拓扑绑定、fabric manager
+#    对照理论带宽，差一半通常是跨 NUMA 或 RoCE 无损网络没配对
+
+# 3. EvalScope：模型评估与推理性能基准
+#    产出 TTFT、TPOT、吞吐等业务侧关心的指标
+```
+
+<Callout type="warn" title="推理服务的容量规划要用 TTFT 和 TPOT，不是 QPS">
+传统服务按 QPS 规划容量，但 LLM 推理的响应时间取决于输出长度，QPS 这个指标几乎没有可比性。
+
+要用的两个指标：
+
+- **TTFT**（Time To First Token）—— 用户感知的「开始响应」延迟，受 prefill 阶段和排队影响
+- **TPOT**（Time Per Output Token）—— 生成速度，决定「打字机效果」流不流畅
+
+容量规划的问题应该问成：**「在 TTFT < 1s、TPOT < 50ms 的前提下，这个副本能承载多少并发」**。用 EvalScope 压出这条曲线，才能算清要几张卡。
+</Callout>
+
+<Quiz
+  id="serv-1"
+  question="要部署 DeepSeek R1 671B，单机 8 卡装不下，需要跨节点。应该用什么？"
+  options={[
+    { text: 'LeaderWorkerSet —— 多个 Pod 组成一个推理实例，整组伸缩与升级', correct: true },
+    { text: 'Deployment，副本数设成 4', feedback: 'Deployment 的每个副本是独立等价的，而跨节点推理需要 4 个 Pod 协同构成一个实例 —— 语义完全不同。' },
+    { text: 'StatefulSet', feedback: '能拿到稳定的网络标识，但没有「组」的概念：伸缩是逐个 Pod 的，也无法保证整组一起滚动升级。' },
+    { text: 'Job + gang scheduling', feedback: 'Job 是跑完退出的语义，推理服务需要长期运行。' },
+  ]}
+  explain={<>跨节点推理打破了「一个 Pod = 一个副本」的假设：4 个 Pod 一起才是一个能服务请求的实例，且有 leader/worker 角色分工。LWS 提供组内固定拓扑、整组伸缩、整组滚动升级 —— 这三点 Deployment 和 StatefulSet 都给不了。这本质上和训练侧的 gang scheduling 是同一类问题在推理场景的体现。</>}
+/>
+
+<Quiz
+  id="serv-2"
+  question="训练任务的 GPU 利用率在 30% 和 100% 之间反复波动。以下哪些是合理的排查方向？"
+  options={[
+    { text: '用 elbencho 实测数据集所在存储的读带宽是否够', correct: true },
+    { text: '核对每卡摊到的 CPU 核数（经验值 8–16 核）', correct: true },
+    { text: '检查 DataLoader 的 worker 数量配置', correct: true },
+    { text: '增加 GPU 数量', feedback: '数据管道是瓶颈时，加卡只会让更多卡一起等数据 —— 利用率会更低，成本却更高。' },
+  ]}
+  explain={<>利用率<strong>波动</strong>（而不是恒定偏低）是数据管道跟不上的典型指纹：计算阶段冲到 100%，然后等下一批数据掉到 30%。三个可能的瓶颈层要一起看 —— 存储带宽、CPU 核数、应用侧的 DataLoader 并发。这也是 L0《硬件与拓扑》强调「每卡配足 CPU」的实际原因：八卡机配 64 核，每卡不到 8 核，跑 CV 训练必然卡在预处理上。</>}
+/>
+
+## 这一节的落点
+
+- 训练与推理的诉求几乎相反，要分开设计：**Job + gang** vs **长期运行 + 弹性**
+- 训练用 Trainer/RayJob，`runtimeRef` 让算法团队不用管分布式启动细节
+- **RayCluster 忘了回收是最常见的 GPU 浪费**，一律用 RayJob + `shutdownAfterJobFinishes`
+- 多机慢先看 `NCCL_DEBUG=INFO` 的传输路径：**预期 IB 却显示 TCP 就是绑定问题**
+- 推理三层：单卡 Deployment → 单机多卡张量并行 → **跨节点用 LWS**
+- 模型仓库必须是 **RWX** 卷；权重分发大时用 Dragonfly P2P
+- **GPU 利用率波动 = 数据管道瓶颈**，加卡无用
+- 推理容量规划用 **TTFT / TPOT**，不是 QPS

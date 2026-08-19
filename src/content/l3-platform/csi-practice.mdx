@@ -1,0 +1,339 @@
+上一节讲了 PV / PVC / SC / CSI 的语义。这一节把已有的 Ceph 或 GPFS 真正接进集群，并跑通三件事：**动态供应、在线扩容、卷快照**。
+
+## 先选对后端类型
+
+这是接入前必须定的事，选错了后面所有事情都别扭：
+
+| 后端 | accessModes | 适合 |
+| --- | --- | --- |
+| **ceph-csi-rbd**（块） | RWO | 数据库、单实例写入、需要低延迟 |
+| **ceph-csi-cephfs**（文件） | **RWX** | 多 Pod 共享、训练数据集、模型仓库 |
+| **gpfs-csi**（文件） | **RWX** | 高性能计算、大规模并行读写 |
+| **nfs-csi**（文件） | RWX | 外部 NAS、开发环境、小规模 |
+| **local-storage**（本地盘） | RWO | 缓存、自带 HA 的数据库 |
+
+<Callout type="warn" title="块存储不能通过声明 RWX 变成共享存储">
+上一节强调过，这里再说一次，因为它是接入阶段最高频的错误：`accessModes: [ReadWriteMany]` 只是一个**声明**，不是能力开关。
+
+RBD 是块设备，两个节点同时挂载同一个块设备会写坏文件系统 —— 而 K8s 不会阻止你这么配。测试时两个 Pod 恰好同节点，一切正常；上生产 Pod 分散，数据损坏。
+
+**要多节点共享，必须选文件存储**（CephFS / GPFS / NFS）。
+</Callout>
+
+## 接入 ceph-csi-rbd
+
+### 1. 部署驱动
+
+```bash
+# values.yml 里填 Ceph 集群连接信息，来自 ceph.conf
+# csiConfig:
+#   - clusterID: 8d2f1c3a-7b41-4c9e-9f2a-5c6d8e0a1b23
+#     monitors:
+#       - 192.168.201.1:6789
+#       - 192.168.201.2:6789
+#       - 192.168.201.3:6789
+
+helmwave up --build
+
+# 两侧都要就绪
+kubectl -n ceph-csi-rbd get pod
+# csi-rbdplugin-provisioner-xxx   （Deployment，负责创建卷）
+# csi-rbdplugin-xxx               （DaemonSet，负责挂载卷）
+```
+
+多个 Ceph 集群就在 `csiConfig` 里继续追加，每个一个 `clusterID`。
+
+### 2. 创建 StorageClass
+
+约定：**一个 StorageClass 一个目录**，里面放 secret 和 sc 两个文件，用 kustomize 管理。
+
+```yaml
+# block-nvme/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: csi-rbd-secret-bj1rbd01
+  namespace: ceph-csi-rbd
+stringData:
+  userID: bj1rbd01                  # 来自 ceph.client.bj1rbd01.keyring 的名字
+  userKey: AQBxxxxxxxxxxxxxx==      # 来自该 keyring 文件的内容
+```
+
+```yaml
+# block-nvme/storageclass.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: block-nvme
+provisioner: rbd.csi.ceph.com
+parameters:
+  clusterID: 8d2f1c3a-7b41-4c9e-9f2a-5c6d8e0a1b23
+  pool: bj1rbd01                    # 与 keyring 名中的池对应
+  imageFeatures: layering
+  csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret-bj1rbd01
+  csi.storage.k8s.io/provisioner-secret-namespace: ceph-csi-rbd
+  csi.storage.k8s.io/node-stage-secret-name: csi-rbd-secret-bj1rbd01
+  csi.storage.k8s.io/node-stage-secret-namespace: ceph-csi-rbd
+  csi.storage.k8s.io/fstype: ext4
+reclaimPolicy: Retain               # 生产数据用 Retain
+allowVolumeExpansion: true          # 想扩容必须开，且不能事后补
+volumeBindingMode: Immediate
+```
+
+```bash
+kubectl apply -k block-nvme/
+```
+
+<Callout type="trap" title="用户权限的 pool 必须和 SC 的 pool 一致">
+这是接入 ceph-csi 时最高频的配置错误，也是《PVC Pending 闯关》里的根因：
+
+```bash
+ceph auth get client.bj1rbd01
+# caps osd = "profile rbd pool=kube"      ← 权限限定在 kube 池
+# 而 StorageClass 里写的是 pool: bj1rbd01  ← 目标是另一个池
+```
+
+结果是每次创建卷都被 Ceph 侧拒绝，报 `rados: ret=-13, Permission denied`。
+
+接入时先把这三处对齐再动手：**keyring 的名字、caps 里的 pool、StorageClass 的 pool**。
+</Callout>
+
+### 3. 测试
+
+```yaml
+# tests.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: rbd-test }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: block-nvme
+  resources: { requests: { storage: 10Gi } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: rbd-test-pod }
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sleep", "3600"]
+      volumeMounts: [{ name: data, mountPath: /var/lib/www }]
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: rbd-test }
+```
+
+```bash
+kubectl apply -f tests.yaml
+kubectl get pvc rbd-test           # 应该在几秒内变成 Bound
+kubectl exec -it rbd-test-pod -- df -h /var/lib/www
+
+# 在 Ceph 侧确认卷真的建出来了
+rbd ls -p bj1rbd01
+
+# 测完清理
+kubectl delete -f tests.yaml
+```
+
+## 接入 gpfs-csi
+
+GPFS 的接入比 Ceph 复杂，因为它有两个前置概念要先定清楚。
+
+### 部署模式
+
+| 模式 | 说明 | 要求 |
+| --- | --- | --- |
+| **客户端全部加入服务端集群** | 所有 K8s 节点加入 GPFS 服务端集群 | 统一 `/etc/hosts`、所有客户端与仲裁节点免密、**一套 GUI** |
+| **服务端与客户端集群分开** | accessing 集群远程挂载 owning 集群 | 各自独立的仲裁节点与 GUI，两边仲裁节点互相免密 |
+
+第一种简单，第二种隔离性更好（客户端集群的问题不会影响存储集群的仲裁）。
+
+<Callout type="note" title="GPFS CSI 依赖 GUI 服务，这是 Ceph 没有的">
+gpfs-csi 不直接调 `mm*` 命令，它通过 **GPFS GUI 的 REST API** 管理 fileset 和配额。
+
+所以部署 CSI 之前，GPFS 集群必须先把 GUI 服务装好并能访问 —— 这一步经常被漏掉，然后 CSI 起来了但创建卷一直失败。
+
+分离部署模式下，**accessing 集群也需要自己的 GUI**，不是只有 owning 集群要。
+</Callout>
+
+前置检查清单：
+
+```bash
+# 1. 文件系统已挂载且所有节点一致
+mmlsmount all -L
+
+# 2. GUI 服务可访问
+curl -k -u <user>:<pass> https://<gui-node>:443/scalemgmt/v2/cluster
+
+# 3. 所有节点的 /etc/hosts 一致 —— GPFS 对主机名解析非常敏感
+# 4. 免密登录按部署模式的要求配好
+# 5. 集群健康
+mmhealth cluster show
+mmgetstate -a
+```
+
+### StorageClass
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: { name: gpfs-fs1 }
+provisioner: spectrumscale.csi.ibm.com
+parameters:
+  volBackendFs: fs1                # 文件系统名
+  clusterId: "215057217487177715"  # mmlscluster 里的 cluster id
+  volDirBasePath: /fs1/k8s-volumes # 目录型卷的基路径
+  # 或者用 fileset 型：
+  # filesetType: independent
+  # inodeLimit: "1024000"
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+```
+
+<Callout type="warn" title="fileset 型 vs 目录型，选择影响长期运维">
+- **目录型（lightweight）** —— 每个 PV 就是文件系统里的一个目录。创建快、数量不限，但**没有独立配额和快照**
+- **fileset 型** —— 每个 PV 是一个独立 fileset，支持配额、快照、独立 inode 空间；但 fileset 数量有上限（通常 1000 个）
+
+大量小卷用目录型，需要配额和快照的重要数据用 fileset 型。**这个选择写在 SC 里，建好的 PV 改不了**，所以通常两种 SC 都建，让用户按需选。
+</Callout>
+
+## 卷快照
+
+快照需要先装 external-snapshotter 的 CRD 和控制器（K8s 不自带）：
+
+```bash
+# volumesnapshots：CRD + snapshot-controller
+kubectl apply -k volumesnapshots/
+kubectl get crd | grep snapshot
+```
+
+```yaml
+# 1. VolumeSnapshotClass
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata: { name: csi-rbd-snapclass }
+driver: rbd.csi.ceph.com
+deletionPolicy: Retain
+parameters:
+  clusterID: 8d2f1c3a-7b41-4c9e-9f2a-5c6d8e0a1b23
+  csi.storage.k8s.io/snapshotter-secret-name: csi-rbd-secret-bj1rbd01
+  csi.storage.k8s.io/snapshotter-secret-namespace: ceph-csi-rbd
+---
+# 2. 打快照
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata: { name: data-snap-20260819 }
+spec:
+  volumeSnapshotClassName: csi-rbd-snapclass
+  source: { persistentVolumeClaimName: data-pvc }
+---
+# 3. 从快照恢复成一个新 PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: data-restored }
+spec:
+  storageClassName: block-nvme
+  dataSource:
+    name: data-snap-20260819
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 10Gi } }
+```
+
+```bash
+kubectl get volumesnapshot
+# NAME                 READYTOUSE   SOURCEPVC   RESTORESIZE
+# data-snap-20260819   true         data-pvc    10Gi
+```
+
+<Callout type="trap" title="CSI 快照不是应用一致的备份">
+快照是**存储层的时间点副本**。对数据库来说，那一刻内存里还有没落盘的数据、事务可能处于中间状态 —— 恢复出来的可能是一个需要 crash recovery 的库，甚至是损坏的。
+
+要应用一致，得配合应用侧动作：
+
+```yaml
+# 用 Pod 的 preStop 或者专门的 hook 先 flush
+# MySQL:  FLUSH TABLES WITH READ LOCK
+# etcd:   用 etcdctl snapshot 而不是卷快照
+```
+
+**卷快照适合的是「误删文件后快速回滚」和「克隆一份数据做测试」，不能替代应用级备份。** 数据库的备份策略应该是应用层的（mysqldump、pg_basebackup、etcd snapshot），卷快照只是一层额外的保险。
+</Callout>
+
+## 在线扩容
+
+```bash
+# 前提：SC 里 allowVolumeExpansion: true，且这个开关不能事后补给已有的 SC
+kubectl patch pvc data-pvc -p '{"spec":{"resources":{"requests":{"storage":"50Gi"}}}}'
+
+# 观察两个阶段
+kubectl describe pvc data-pvc
+# Conditions:
+#   Resizing              ← 存储侧在扩
+#   FileSystemResizePending  ← 卷扩了，等文件系统扩
+```
+
+<Callout type="warn" title="块存储的文件系统扩容需要 Pod 重启">
+两个阶段的差别很关键：
+
+1. **卷扩容** —— 存储后端把块设备变大，在线完成
+2. **文件系统扩容** —— 需要在挂载点上执行 `resize2fs` / `xfs_growfs`
+
+对块存储（RBD），第 2 步由 node plugin 在**下次挂载时**执行，所以 PVC 会停在 `FileSystemResizePending`，直到 Pod 重启。
+
+文件存储（CephFS / GPFS / NFS）没有这个问题 —— 它们没有块设备层，改配额立即生效。
+
+这意味着「在线扩容」对块存储来说是有条件的：容量扩了，但要用上得重启 Pod。给数据库扩容时这一点必须提前告知业务方。
+</Callout>
+
+## 接入验收清单
+
+每接一个后端，把这七项跑完再交付：
+
+| # | 验收项 | 方法 |
+| --- | --- | --- |
+| 1 | 动态供应 | 建 PVC，几秒内 Bound |
+| 2 | 挂载可读写 | Pod 里 `dd` 写入并读回 |
+| 3 | Pod 重建后数据还在 | 删 Pod 重建，验证文件 |
+| 4 | 跨节点重新挂载 | 用 nodeSelector 强制换节点 |
+| 5 | 在线扩容 | patch PVC，确认容量变化 |
+| 6 | 快照与恢复 | 打快照 → 删数据 → 从快照恢复 |
+| 7 | **删 PVC 后后端的行为** | 确认 `Retain` 真的保留了后端卷 |
+
+第 7 项最容易被跳过，但它决定了误删 PVC 时数据还在不在 —— 必须实测一次，而不是「配了 Retain 应该没问题」。
+
+<Quiz
+  id="csi-1"
+  question="给一个用 ceph-csi-rbd 的 PVC 扩容，PVC 停在 FileSystemResizePending。原因和处理？"
+  options={[
+    { text: '块设备已扩，但文件系统扩容需要 node plugin 在下次挂载时执行 —— 重启 Pod 即可', correct: true },
+    { text: 'SC 没开 allowVolumeExpansion', feedback: '没开的话 patch PVC 会直接被拒绝，不会进入 Resizing 阶段。' },
+    { text: 'Ceph 池容量不足', feedback: '容量不足会在 Resizing 阶段就失败并报错，而不是进到等待文件系统扩容这一步。' },
+    { text: '需要手工在节点上执行 resize2fs', feedback: '不需要手工做 —— node plugin 会在挂载时自动执行。手工介入反而可能和 CSI 的状态机冲突。' },
+  ]}
+  explain={<>块存储的扩容是两段式的：存储侧扩块设备（在线），然后文件系统要 <code>resize2fs</code>/<code>xfs_growfs</code> 才能用上新空间，而这一步由 node plugin 在挂载时做。所以对块存储，「在线扩容」实际上是「在线扩容量 + 重启 Pod 生效」。文件存储（CephFS/GPFS）没有块设备层，改配额立即生效 —— 这也是数据库选型时值得考虑的一个差异。</>}
+/>
+
+<Quiz
+  id="csi-2"
+  question="关于 CSI 卷快照，下面哪些说法正确？"
+  options={[
+    { text: '它是存储层的时间点副本，不保证应用一致性', correct: true },
+    { text: '数据库的备份应该用应用级方案，卷快照只是额外保险', correct: true },
+    { text: '需要先部署 external-snapshotter 的 CRD 和控制器', correct: true },
+    { text: '从快照恢复会直接覆盖原 PVC', feedback: '不会。恢复是创建一个<strong>新的</strong> PVC，用 dataSource 指向快照 —— 原 PVC 不受影响。' },
+  ]}
+  explain={<>快照在存储层是原子的，但应用层不是：那一刻数据库内存里的脏页没落盘、事务可能在中间状态，恢复出来可能需要 crash recovery。所以它适合「误删文件回滚」和「克隆数据做测试」，不能替代 <code>mysqldump</code> / <code>pg_basebackup</code> / <code>etcdctl snapshot</code> 这类应用级备份。另外 K8s 不自带快照能力，CRD 和控制器要单独装。</>}
+/>
+
+## 这一节的落点
+
+- 先按 accessModes 选对后端：**要 RWX 必须用文件存储**，块存储声明 RWX 会坏数据
+- ceph-csi 接入先对齐三处：**keyring 名、caps 的 pool、SC 的 pool**
+- gpfs-csi **依赖 GUI 服务**，分离部署时两个集群各自都要有
+- GPFS 的 fileset 型与目录型影响配额和快照能力，**建好改不了**，通常两种 SC 都建
+- 快照要先装 external-snapshotter；它**不是应用一致的备份**
+- 块存储扩容需要重启 Pod 才生效，扩容前要告知业务方
+- 验收七项里，**第 7 项（删 PVC 后 Retain 是否真生效）必须实测**
