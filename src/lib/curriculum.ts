@@ -65,7 +65,7 @@ export const KIND_STYLE: Record<LessonKind, string> = {
 const repo = (path: string): LessonRef => ({ label: 'k8s-in-action', path })
 const REF_UPSTREAM: LessonRef = { label: 'Kubernetes 官方文档', href: 'https://kubernetes.io/zh-cn/docs/home/' }
 const REF_STORPATH: LessonRef = { label: 'Storpath 存储工程师成长路径', href: 'https://storpath.wutz.dev/' }
-const REF_NETPATH: LessonRef = { label: 'Netpath 网络工程师成长路径', href: 'https://netpath.wutz.dev/' }
+const REF_NETPATH: LessonRef = { label: 'Netpath 网络运维工程师成长路径', href: 'https://netpath.wutz.dev/' }
 
 export const tracks: Track[] = [
   {
