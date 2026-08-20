@@ -53,20 +53,12 @@ function RootLayout() {
                 实验与闯关
               </Link>
               <a
-                href="https://storpath.wutz.dev/"
+                href="https://wutz.dev/"
                 target="_blank"
                 rel="noreferrer"
                 className="shrink-0 rounded-lg px-2.5 py-1.5 text-gray-600 transition hover:bg-gray-100 sm:px-3"
               >
-                Storpath ↗
-              </a>
-              <a
-                href="https://netpath.wutz.dev/"
-                target="_blank"
-                rel="noreferrer"
-                className="shrink-0 rounded-lg px-2.5 py-1.5 text-gray-600 transition hover:bg-gray-100 sm:px-3"
-              >
-                Netpath ↗
+                wutz.dev ↗
               </a>
             </nav>
           </div>
