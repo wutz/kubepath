@@ -61,8 +61,8 @@ export function Quiz({
   }
 
   return (
-    <section className="border-hairline bg-canvas shadow-card my-6 rounded-xl border">
-      <header className="border-hairline flex items-center gap-2.5 border-b px-4 py-3">
+    <section className="bg-canvas shadow-card my-6 overflow-hidden rounded-md">
+      <header className="border-line flex items-center gap-2.5 border-b px-4 py-3">
         <span className="eyebrow">检查点</span>
         <span className="text-mute text-xs">{multi ? '多选' : '单选'}</span>
       </header>
@@ -74,10 +74,11 @@ export function Quiz({
           {options.map((option, index) => {
             const chosen = picked.includes(index)
             const reveal = submitted
-            let cls = 'border-hairline hover:border-brand-500 hover:bg-brand-50/50'
-            if (chosen && !reveal) cls = 'border-brand-500 bg-brand-50'
-            if (reveal && option.correct) cls = 'border-emerald-300 bg-emerald-50'
-            if (reveal && chosen && !option.correct) cls = 'border-rose-300 bg-rose-50'
+            /* 对/错沿用语义色：brand 在这里已经被"已选中"占掉了 */
+            let cls = 'border-line hover:border-brand-600 hover:bg-soft'
+            if (chosen && !reveal) cls = 'border-brand-600 bg-brand-50'
+            if (reveal && option.correct) cls = 'border-brand-600 bg-brand-50'
+            if (reveal && chosen && !option.correct) cls = 'border-danger bg-danger-soft/40'
 
             return (
               <li key={index}>
@@ -85,7 +86,7 @@ export function Quiz({
                   type="button"
                   onClick={() => toggle(index)}
                   disabled={submitted}
-                  className={`w-full rounded-lg border px-3 py-2.5 text-left text-sm transition ${cls} ${
+                  className={`w-full rounded-sm border px-3 py-2.5 text-left text-sm transition ${cls} ${
                     submitted ? 'cursor-default' : 'cursor-pointer'
                   }`}
                 >
@@ -94,7 +95,7 @@ export function Quiz({
                   </span>
                   <span className="text-ink">{option.text}</span>
                   {reveal && chosen && !option.correct && option.feedback && (
-                    <span className="mt-1 block text-xs text-rose-700">{option.feedback}</span>
+                    <span className="text-danger-deep mt-1 block text-xs">{option.feedback}</span>
                   )}
                 </button>
               </li>
@@ -107,27 +108,28 @@ export function Quiz({
             type="button"
             onClick={submit}
             disabled={!picked.length}
-            className="bg-ink disabled:bg-hairline disabled:text-mute mt-4 rounded-full px-5 py-2 text-sm font-medium text-white transition hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-100"
+            className="bg-brand-600 hover:bg-brand-700 disabled:bg-soft-2 disabled:text-mute mt-4 rounded-sm px-4 py-2.5 text-sm font-medium text-white transition disabled:cursor-not-allowed"
           >
             提交
           </button>
         ) : (
           <div className="mt-4">
-            <div
-              className={`rounded-lg border px-3.5 py-3 text-sm ${
-                isCorrect
-                  ? 'border-emerald-100 bg-emerald-50 text-emerald-800'
-                  : 'border-rose-100 bg-rose-50 text-rose-800'
-              }`}
-            >
-              <strong className="font-medium">{isCorrect ? '答对了。' : '还不对。'}</strong>
-              {explain ? <div className="text-body mt-1.5">{explain}</div> : null}
+            <div className="bg-canvas shadow-card flex overflow-hidden rounded-md text-sm">
+              <span
+                className={`w-0.5 shrink-0 ${isCorrect ? 'bg-brand-600' : 'bg-danger'}`}
+              />
+              <div className="min-w-0 flex-1 px-4 py-3">
+                <strong className={`font-medium ${isCorrect ? 'text-brand-700' : 'text-danger-deep'}`}>
+                  {isCorrect ? '答对了。' : '还不对。'}
+                </strong>
+                {explain ? <div className="text-body mt-1.5">{explain}</div> : null}
+              </div>
             </div>
             {!isCorrect && (
               <button
                 type="button"
                 onClick={retry}
-                className="border-hairline text-ink hover:border-hairline-strong mt-3 rounded-full border px-5 py-1.5 text-sm font-medium transition"
+                className="bg-canvas text-ink shadow-card hover:shadow-float mt-3 rounded-sm px-4 py-2 text-sm font-medium transition"
               >
                 再试一次
               </button>

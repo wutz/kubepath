@@ -84,9 +84,9 @@ function Field({
   )
 }
 
-/* DESIGN.md 的 form-input：hairline 边框、6px 圆角、focus 时才亮出品牌蓝 */
+/* DESIGN.md 的 form-input：line 边框、6px 圆角、focus 时才亮出品牌蓝 */
 const inputCls =
-  'border-hairline bg-canvas text-ink focus:border-brand-500 focus:ring-brand-100 w-full rounded-md border px-3 py-2 font-mono text-sm outline-none focus:ring-2'
+  'border-line bg-canvas text-ink focus:border-brand-600 focus:ring-brand-100 w-full rounded-sm border px-3 py-2 font-mono text-sm outline-none focus:ring-2'
 
 /**
  * 集群容量推算器。
@@ -111,8 +111,8 @@ export function ClusterCapacityPlanner() {
   })
 
   return (
-    <section className="border-hairline bg-canvas shadow-card my-6 overflow-hidden rounded-xl border">
-      <header className="border-hairline flex items-center justify-between border-b px-4 py-3">
+    <section className="bg-canvas shadow-card my-6 overflow-hidden rounded-md">
+      <header className="border-line flex items-center justify-between border-b px-4 py-3">
         <div className="flex items-center gap-2.5">
           <span className="eyebrow">计算器</span>
           <span className="text-ink text-sm font-medium">集群容量推算</span>
@@ -126,13 +126,13 @@ export function ClusterCapacityPlanner() {
         </button>
       </header>
 
-      <div className="border-hairline flex gap-2 overflow-x-auto border-b px-4 py-3">
+      <div className="border-line flex gap-2 overflow-x-auto border-b px-4 py-3">
         {PRESETS.map((preset) => (
           <button
             key={preset.id}
             type="button"
             onClick={() => setInput(preset.input)}
-            className="border-hairline hover:border-brand-500 hover:bg-brand-50/50 shrink-0 rounded-lg border px-3 py-1.5 text-left transition"
+            className="border-line hover:border-brand-600 hover:bg-soft shrink-0 rounded-sm border px-3 py-1.5 text-left transition"
           >
             <span className="text-ink block text-xs font-medium">{preset.label}</span>
             <span className="text-mute block text-[11px]">{preset.desc}</span>
@@ -210,7 +210,7 @@ export function ClusterCapacityPlanner() {
 
         <div className="space-y-3">
           {/* 结论用墨黑面反白，是这个组件里唯一的"极性翻转"——DESIGN.md 的 dark band 做法 */}
-          <div className="bg-ink rounded-xl px-4 py-5 text-center">
+          <div className="bg-ink rounded-md px-4 py-5 text-center">
             <div className="font-mono text-[11px] tracking-wider text-white/50 uppercase">
               集群可调度 Pod 数
             </div>
@@ -223,7 +223,7 @@ export function ClusterCapacityPlanner() {
             </div>
           </div>
 
-          <div className="border-hairline rounded-xl border px-3.5 py-3">
+          <div className="border-line rounded-md border px-3.5 py-3">
             <div className="text-body text-xs font-medium">四条限制，最小的那条说了算</div>
             <ul className="mt-2 space-y-1.5">
               {(Object.keys(BOTTLENECK_LABEL) as BottleneckId[]).map((id) => {
@@ -245,9 +245,9 @@ export function ClusterCapacityPlanner() {
                         {formatNumber(value)} Pod
                       </span>
                     </div>
-                    <div className="bg-canvas-soft-2 mt-1 h-1 overflow-hidden rounded-full">
+                    <div className="bg-soft-2 mt-1 h-1 overflow-hidden rounded-full">
                       <div
-                        className={`h-full rounded-full ${hit ? 'bg-brand-500' : 'bg-hairline-strong'}`}
+                        className={`h-full rounded-full ${hit ? 'bg-brand-600' : 'bg-line-strong'}`}
                         style={{ width: `${ratio * 100}%` }}
                       />
                     </div>
@@ -260,7 +260,7 @@ export function ClusterCapacityPlanner() {
             </p>
           </div>
 
-          <dl className="divide-hairline border-hairline rounded-xl border text-sm divide-y">
+          <dl className="divide-line border-line rounded-md border text-sm divide-y">
             {[
               [
                 '单节点 CPU 可分配',
@@ -291,7 +291,7 @@ export function ClusterCapacityPlanner() {
             ))}
           </dl>
 
-          <div className="border-brand-100 bg-brand-50/70 text-brand-700 rounded-xl border px-3.5 py-3 text-xs">
+          <div className="bg-brand-50 text-brand-700 rounded-md px-3.5 py-3 text-xs">
             <div className="font-medium">
               建议控制面：{result.controlPlane.nodes} 台 × {result.controlPlane.cpu} 核 /{' '}
               {result.controlPlane.memGiB} GiB
@@ -300,7 +300,7 @@ export function ClusterCapacityPlanner() {
           </div>
 
           {result.warnings.length > 0 && (
-            <ul className="space-y-1.5 rounded-xl border border-amber-100 bg-amber-50 px-3.5 py-3 text-xs text-amber-900">
+            <ul className="border-warn-soft bg-warn-soft/40 text-warn-deep space-y-1.5 rounded-md border px-3.5 py-3 text-xs">
               {result.warnings.map((warning) => (
                 <li key={warning} className="flex gap-1.5">
                   <span className="shrink-0">⚠</span>

@@ -79,7 +79,7 @@ const STEPS: Step[] = [
  * 也就是说色相本身没编码任何信息。收成一种高亮样式，读起来反而更清楚：
  * 有颜色的那个就是当前这一步的执行者。
  */
-const ACTOR_ACTIVE = 'border-brand-200 bg-brand-50 text-brand-700'
+const ACTOR_ACTIVE = 'border-brand-600 bg-brand-50 text-brand-700'
 
 export function ApplyFlow() {
   const [at, setAt] = useState(0)
@@ -91,8 +91,8 @@ export function ApplyFlow() {
   const step = STEPS[at]
 
   return (
-    <section className="border-hairline bg-canvas shadow-card my-6 overflow-hidden rounded-xl border">
-      <header className="border-hairline flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
+    <section className="bg-canvas shadow-card my-6 overflow-hidden rounded-md">
+      <header className="border-line flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
         <div className="flex items-center gap-2.5">
           <span className="eyebrow">推演</span>
           <span className="text-body font-mono text-xs">kubectl apply -f deploy.yaml</span>
@@ -102,7 +102,7 @@ export function ApplyFlow() {
         </span>
       </header>
 
-      <div className="border-hairline bg-canvas-soft border-b px-4 py-3">
+      <div className="border-line bg-soft border-b px-4 py-3">
         <div className="text-mute text-[11px]">点组件可以把它「打挂」，看链路断在哪</div>
         <div className="mt-2 flex flex-wrap gap-1.5">
           {COMPONENTS.map((comp) => {
@@ -115,10 +115,10 @@ export function ApplyFlow() {
                 onClick={() => setDown(isDown ? null : comp.id)}
                 className={`rounded-lg border px-2.5 py-1.5 text-left text-xs transition ${
                   isDown
-                    ? 'border-rose-200 bg-rose-50 text-rose-700 line-through'
+                    ? 'border-danger bg-danger-soft/40 text-danger-deep line-through'
                     : isActor
                       ? ACTOR_ACTIVE
-                      : 'border-hairline bg-canvas text-mute hover:border-hairline-strong'
+                      : 'border-line bg-canvas text-mute hover:border-line-strong'
                 }`}
               >
                 <span className="block font-mono">{comp.label}</span>
@@ -129,7 +129,7 @@ export function ApplyFlow() {
         </div>
       </div>
 
-      <ol className="border-hairline flex gap-1 border-b px-4 py-3">
+      <ol className="border-line flex gap-1 border-b px-4 py-3">
         {STEPS.map((s, i) => {
           const reachable = brokenAt < 0 || i < brokenAt
           return (
@@ -142,7 +142,7 @@ export function ApplyFlow() {
               >
                 <div
                   className={`h-1 rounded-full transition ${
-                    !reachable ? 'bg-rose-200' : i <= at ? 'bg-brand-500' : 'bg-canvas-soft-2'
+                    !reachable ? 'bg-danger-soft' : i <= at ? 'bg-brand-600' : 'bg-soft-2'
                   }`}
                 />
                 <span
@@ -163,20 +163,20 @@ export function ApplyFlow() {
           <span className={`rounded border px-2 py-0.5 font-mono text-xs ${ACTOR_ACTIVE}`}>
             {COMPONENTS.find((c) => c.id === step.actor)?.label}
           </span>
-          <h4 className="text-ink font-semibold tracking-tight">{step.title}</h4>
+          <h4 className="display-sm">{step.title}</h4>
         </div>
 
         <p className="text-body mt-2.5 text-sm leading-relaxed">{step.detail}</p>
 
         {blocked ? (
-          <div className="mt-3 rounded-lg border border-rose-100 bg-rose-50 px-3.5 py-3 text-sm">
-            <div className="font-medium text-rose-800">
+          <div className="border-danger-soft bg-danger-soft/30 mt-3 rounded-sm border px-3.5 py-3 text-sm">
+            <div className="text-danger-deep font-medium">
               {COMPONENTS.find((c) => c.id === down)?.label} 挂了，链路断在第 {brokenAt + 1} 步
             </div>
-            <p className="mt-1 leading-relaxed text-rose-700">{STEPS[brokenAt].stuck}</p>
+            <p className="text-body mt-1 leading-relaxed">{STEPS[brokenAt].stuck}</p>
           </div>
         ) : (
-          <div className="border-hairline bg-canvas-soft mt-3 rounded-lg border px-3.5 py-3 text-sm">
+          <div className="bg-soft mt-3 rounded-sm px-3.5 py-3 text-sm">
             <span className="text-mute text-xs">这一步之后：</span>
             <span className="text-ink ml-1.5">{step.state}</span>
           </div>
@@ -187,7 +187,7 @@ export function ApplyFlow() {
             type="button"
             onClick={() => setAt((v) => Math.max(0, v - 1))}
             disabled={at === 0}
-            className="border-hairline text-ink hover:border-hairline-strong rounded-full border px-4 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40"
+            className="bg-canvas text-ink shadow-card hover:shadow-float rounded-sm px-4 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40"
           >
             ← 上一步
           </button>
@@ -195,7 +195,7 @@ export function ApplyFlow() {
             type="button"
             onClick={() => setAt((v) => Math.min(STEPS.length - 1, v + 1))}
             disabled={at === STEPS.length - 1}
-            className="bg-ink disabled:bg-hairline disabled:text-mute rounded-full px-4 py-1.5 text-sm font-medium text-white transition hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-100"
+            className="bg-brand-600 hover:bg-brand-700 disabled:bg-soft-2 disabled:text-mute rounded-sm px-4 py-1.5 text-sm font-medium text-white transition disabled:cursor-not-allowed"
           >
             下一步 →
           </button>

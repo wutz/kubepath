@@ -17,6 +17,13 @@ export const Route = createRootRoute({
     links: [
       { rel: 'stylesheet', href: appCss },
       { rel: 'icon', href: '/logo.svg', type: 'image/svg+xml' },
+      /* Geist / Geist Mono —— 与 storpath 同一份字体来源 */
+      { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
+      { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossOrigin: 'anonymous' },
+      {
+        rel: 'stylesheet',
+        href: 'https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap',
+      },
     ],
   }),
   component: RootLayout,
@@ -28,28 +35,30 @@ function RootLayout() {
       <head>
         <HeadContent />
       </head>
-      <body className="bg-canvas-soft font-sans text-ink min-h-screen antialiased">
+      <body className="bg-soft font-sans text-ink min-h-screen antialiased">
         {/* 顶栏固定 64px（DESIGN.md nav-bar）；styles.css 的 scroll-padding-top 跟着这个高度 */}
-        <header className="border-hairline bg-canvas/80 sticky top-0 z-20 border-b backdrop-blur">
-          <div className="mx-auto flex h-16 max-w-6xl items-center justify-between gap-2 px-3 sm:px-4">
-            <Link to="/" className="flex shrink-0 items-center gap-2">
-              <img src="/logo.svg" alt="" width={28} height={28} className="h-7 w-7 shrink-0" />
-              <span className="text-[15px] font-semibold tracking-tight">Kubepath</span>
-              <span className="text-mute hidden text-xs sm:inline">K8s 工程师成长路径</span>
+        <header className="border-line bg-canvas/85 sticky top-0 z-20 border-b backdrop-blur">
+          <div className="mx-auto flex h-16 max-w-6xl items-center justify-between gap-2 px-4 sm:px-6">
+            <Link to="/" className="flex shrink-0 items-center gap-2.5">
+              <img src="/logo.svg" alt="" width={26} height={26} className="h-6.5 w-6.5 shrink-0" />
+              <span className="text-[15px] font-semibold tracking-[-0.02em]">Kubepath</span>
+              <span className="border-line text-mute hidden border-l pl-2.5 text-xs sm:inline">
+                K8s 工程师成长路径
+              </span>
             </Link>
-            <nav className="-mr-1 flex items-center gap-0.5 overflow-x-auto text-sm [scrollbar-width:none] sm:gap-1 [&::-webkit-scrollbar]:hidden">
+            <nav className="-mr-1 flex items-center gap-0.5 overflow-x-auto text-sm [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               <Link
                 to="/"
                 activeOptions={{ exact: true }}
-                activeProps={{ className: 'bg-brand-50 text-brand-700 font-medium' }}
-                className="text-body hover:text-ink hover:bg-canvas-soft-2 shrink-0 rounded-full px-3 py-1.5 transition"
+                activeProps={{ className: 'bg-soft-2 text-ink' }}
+                className="text-body hover:bg-soft-2 hover:text-ink shrink-0 rounded-full px-3 py-1.5 transition"
               >
                 路径
               </Link>
               <Link
                 to="/labs"
-                activeProps={{ className: 'bg-brand-50 text-brand-700 font-medium' }}
-                className="text-body hover:text-ink hover:bg-canvas-soft-2 shrink-0 rounded-full px-3 py-1.5 transition"
+                activeProps={{ className: 'bg-soft-2 text-ink' }}
+                className="text-body hover:bg-soft-2 hover:text-ink shrink-0 rounded-full px-3 py-1.5 transition"
               >
                 实验与闯关
               </Link>
@@ -57,7 +66,7 @@ function RootLayout() {
                 href="https://wutz.dev/"
                 target="_blank"
                 rel="noreferrer"
-                className="text-body hover:text-ink hover:bg-canvas-soft-2 shrink-0 rounded-full px-3 py-1.5 transition"
+                className="text-body hover:bg-soft-2 hover:text-ink shrink-0 rounded-full px-3 py-1.5 transition"
               >
                 wutz.dev ↗
               </a>
@@ -65,14 +74,14 @@ function RootLayout() {
           </div>
         </header>
 
-        <main className="mx-auto max-w-6xl px-3 py-8 sm:px-4 sm:py-12">
+        <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6 sm:py-12">
           <Outlet />
         </main>
 
-        <footer className="border-hairline bg-canvas mt-16 border-t sm:mt-24">
-          <div className="mx-auto max-w-6xl px-3 py-10 sm:px-4">
+        <footer className="border-line bg-canvas mt-16 border-t sm:mt-24">
+          <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
             <div className="eyebrow">Kubepath</div>
-            <p className="text-body mt-2 max-w-3xl text-sm leading-relaxed">
+            <p className="text-body mt-3 max-w-3xl text-sm leading-relaxed">
               K8s 工程师成长路径，按岗位分成方案、集群运维、存储运维三条路线。内容基于
               k8s-in-action 部署手册与 Kubernetes 官方文档整理。
             </p>

@@ -37,16 +37,6 @@ export interface Track {
   title: string
   subtitle: string
   goal: string
-  /**
-   * 阶段配色。只出现在小徽标和小圆点上 —— 大块彩色底板一律不用，
-   * 颜色在这套 UI 里只负责"这是哪个阶段"，不负责装饰。
-   * 五个阶段按 L0→L4 排成 蓝→青→紫→粉→琥珀 的递进，取自 DESIGN.md 的 gradient 色系。
-   */
-  accent: {
-    /** 一整串徽标类名（底色 + 文字色） */
-    chip: string
-    dot: string
-  }
   lessons: Lesson[]
 }
 
@@ -58,16 +48,20 @@ export const KIND_LABEL: Record<LessonKind, string> = {
 }
 
 /*
- * 课程类型徽标。阶段色已经占掉了"颜色"这一维，这里就不再各占一个色相：
- * 「原理」是默认形态，走中性灰；三种动手环节统一用品牌蓝标出"这节要上手"，
- * 具体是哪一种由标签文字自己说。
+ * 课程类型徽标，与 storpath 同一套映射：
+ * 「原理」是默认形态走中性，三种动手环节各占一个语义色。
+ * 阶段（L0–L4）不参与配色 —— 它的徽标一律中性，颜色这一维只留给类型与状态。
  */
 export const KIND_STYLE: Record<LessonKind, string> = {
-  concept: 'bg-canvas-soft-2 text-mute',
+  concept: 'bg-soft-2 text-body',
   lab: 'bg-brand-50 text-brand-700',
-  quest: 'bg-brand-50 text-brand-700',
-  planner: 'bg-brand-50 text-brand-700',
+  quest: 'bg-warn-soft text-warn-deep',
+  planner: 'bg-plum-soft text-plum-deep',
 }
+
+/** 阶段徽标（L0–L4）：全站统一的中性小标签 */
+export const LEVEL_CHIP =
+  'rounded-xs bg-soft-2 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-body'
 
 /** k8s-in-action 手册里的具体章节，课程页按代码样式展示路径 */
 const repo = (path: string): LessonRef => ({ label: 'k8s-in-action', path })
@@ -82,10 +76,6 @@ export const tracks: Track[] = [
     title: '底座与前置',
     subtitle: '容器、节点与集群规划',
     goal: 'K8s 装在机器上，机器不合格集群就立不住。这一阶段解决三件事：容器到底是什么、节点要调成什么样、集群规模与命名怎么定。',
-    accent: {
-      chip: 'bg-blue-50 text-blue-700',
-      dot: 'bg-blue-500',
-    },
     lessons: [
       {
         id: 'container-runtime',
@@ -221,10 +211,6 @@ export const tracks: Track[] = [
     title: '核心原理',
     subtitle: '控制面、对象与调度',
     goal: '所有排障最终都会回到这一层：一个对象写进 etcd 之后，是谁在看着它、把它变成节点上真实运行的进程。',
-    accent: {
-      chip: 'bg-cyan-50 text-cyan-700',
-      dot: 'bg-cyan-500',
-    },
     lessons: [
       {
         id: 'architecture',
@@ -389,10 +375,6 @@ export const tracks: Track[] = [
     title: '部署与运维',
     subtitle: '主战场：从装出来到扛得住',
     goal: '这一阶段是集群运维的主课：用 kubespray 把集群装出来，然后经历扩缩、升级、备份、节点故障这些必然会来的事。',
-    accent: {
-      chip: 'bg-violet-50 text-violet-700',
-      dot: 'bg-violet-500',
-    },
     lessons: [
       {
         id: 'kubespray-deploy',
@@ -574,10 +556,6 @@ export const tracks: Track[] = [
     title: '平台能力',
     subtitle: '网络、存储与可观测性',
     goal: '裸集群交付不出去。这一阶段把网络、存储、监控和镜像分发接上，让平台真的能承载业务。',
-    accent: {
-      chip: 'bg-pink-50 text-pink-700',
-      dot: 'bg-pink-500',
-    },
     lessons: [
       {
         id: 'cni-cilium',
@@ -767,10 +745,6 @@ export const tracks: Track[] = [
     title: '进阶战场',
     subtitle: 'GPU、AI 负载与规模化',
     goal: '把集群从「能跑业务」推到「能跑 AI 训练与推理、能给多个租户用、能算清账」。',
-    accent: {
-      chip: 'bg-amber-50 text-amber-700',
-      dot: 'bg-amber-500',
-    },
     lessons: [
       {
         id: 'gpu-operator',

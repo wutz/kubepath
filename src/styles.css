@@ -1,61 +1,64 @@
 @import "tailwindcss";
 
 /*
- * 设计 token —— 全站唯一来源，对齐仓库根目录的 DESIGN.md。
+ * 设计 token —— 与 storpath.wutz.dev 共用同一套体系（同源 DESIGN.md / Vercel 语言）。
  *
- * 两条主线：
- * 1. 强调色只有一个：Kubernetes 官方蓝 #326CE5，承担 DESIGN.md 里 link 的角色
- *    （链接、选中态、进度条）。主 CTA 一律是墨黑 ink —— 蓝色不做按钮底色。
- * 2. 中性色是一条有意排过的阶梯，不再随手抓 gray-100/200/300：
- *    文字 ink → body → mute，面 canvas → canvas-soft → canvas-soft-2，线只有 hairline。
+ * 站间约定：中性色、语义色、圆角、阴影、字体、排版类全部对齐，只有 brand 色相
+ * 各站不同 —— storpath 是暖锑红（hue 30），kubepath 用 Kubernetes 官方蓝。
+ * 因此这边没有 storpath 的 --color-info：那一格本来就是蓝的，直接由 brand 顶上。
  */
 @theme {
-  /* ---------- 强调色：Kubernetes 蓝 ---------- */
-  --color-brand-50: #f0f4fe;
-  --color-brand-100: #dce7fd;
-  --color-brand-200: #bfd3fb;
-  --color-brand-500: #326ce5;
-  --color-brand-600: #2059c5;
-  --color-brand-700: #1a479c;
+  /* ---------- brand：Kubernetes 蓝 #326CE5（brand-600 即官方色） ---------- */
+  --color-brand-50: oklch(97.5% 0.016 263);
+  --color-brand-100: oklch(94% 0.04 263);
+  --color-brand-500: oklch(65% 0.17 263);
+  --color-brand-600: oklch(56.5% 0.19 263);
+  --color-brand-700: oklch(49% 0.18 263);
 
-  /* ---------- 文字 ---------- */
+  /* ---------- 中性色（与 storpath 逐个一致） ---------- */
   --color-ink: #171717;
   --color-body: #4d4d4d;
   --color-mute: #888888;
-
-  /* ---------- 面与线 ---------- */
+  --color-line: #ebebeb;
+  --color-line-strong: #a1a1a1;
   --color-canvas: #ffffff;
-  --color-canvas-soft: #fafafa;
-  --color-canvas-soft-2: #f5f5f5;
-  --color-hairline: #ebebeb;
-  --color-hairline-strong: #a1a1a1;
+  --color-soft: #fafafa;
+  --color-soft-2: #f5f5f5;
 
-  /*
-   * 字体。DESIGN.md 点名 Geist / Geist Mono（专有字体），开源替代是 Inter /
-   * JetBrains Mono —— 这里按"装了就用、没装退回系统栈"处理，不引入外部字体请求：
-   * 正文以中文为主，网络字体的收益远小于它的体积。
-   */
+  /* ---------- 语义色（DESIGN.md 原值） ---------- */
+  --color-warn: #f5a623;
+  --color-warn-deep: #ab570a;
+  --color-warn-soft: #ffefcf;
+  --color-danger: #ee0000;
+  --color-danger-deep: #c50000;
+  --color-danger-soft: #f7d4d6;
+  --color-plum-deep: #4c2889;
+  --color-plum-soft: #d8ccf1;
+
+  /* ---------- 字体：Geist / Geist Mono，CJK 回退到系统字体 ---------- */
   --font-sans:
-    Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC",
+    Geist, Inter, ui-sans-serif, system-ui, -apple-system, "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --font-mono:
-    "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
 
   /*
-   * 阴影按 DESIGN.md 的堆叠做法：多层小偏移，不用单发大模糊。
-   * 这里刻意不带 inset ring —— 卡片边框统一交给 border-hairline，避免描两遍。
+   * 阴影自带 inset 1px 描边环，所以卡片不再单独写 border —— 这是这套体系里
+   * "卡片" 的唯一表达方式，三档对应 DESIGN.md 的 Level 2 / 3 / 4。
    */
-  --shadow-card: 0 1px 1px rgb(0 0 0 / 0.02), 0 2px 2px rgb(0 0 0 / 0.04);
-  --shadow-card-lg: 0 2px 2px rgb(0 0 0 / 0.04), 0 8px 16px -4px rgb(0 0 0 / 0.04);
-  --shadow-pop:
-    0 1px 1px rgb(0 0 0 / 0.02), 0 8px 16px -4px rgb(0 0 0 / 0.04),
-    0 24px 32px -8px rgb(0 0 0 / 0.06);
+  --shadow-card: 0 1px 1px #00000005, 0 2px 2px #0000000a, inset 0 0 0 1px #00000014;
+  --shadow-soft: 0 2px 2px #0000000a, 0 8px 8px -8px #0000000a, inset 0 0 0 1px #00000014;
+  --shadow-float: 0 2px 2px #0000000a, 0 8px 16px -4px #0000000a, inset 0 0 0 1px #00000014;
 }
 
-/*
- * 小标签（section eyebrow）。DESIGN.md 把"技术味的小标题"交给 mono，
- * 全站出现十几处，抽成 utility 而不是每次抄六个类名。
- */
+/* ---------- 排版类 ---------- */
+
+/* 技术味的小标题：mono + 大写 + 正字距 */
 @utility eyebrow {
   font-family: var(--font-mono);
   font-size: 0.6875rem;
@@ -63,6 +66,46 @@
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--color-mute);
+}
+
+/*
+ * display 四档。负字距是这套语言的一部分，但幅度按 CJK 收过 ——
+ * DESIGN.md 给 Latin 的 -2.4px/48px 直接套到中文会挤成一团。
+ */
+@utility display-2xl {
+  font-size: 2.5rem;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.05em;
+  color: var(--color-ink);
+  @media (width < 640px) {
+    font-size: 1.875rem;
+    letter-spacing: -0.04em;
+  }
+}
+@utility display-xl {
+  font-size: 2rem;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.04em;
+  color: var(--color-ink);
+  @media (width < 640px) {
+    font-size: 1.5rem;
+  }
+}
+@utility display-md {
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: -0.03em;
+  color: var(--color-ink);
+}
+@utility display-sm {
+  font-size: 1rem;
+  font-weight: 600;
+  line-height: 1.5;
+  letter-spacing: -0.02em;
+  color: var(--color-ink);
 }
 
 html {
@@ -77,6 +120,8 @@ html {
  * 用 clip 而不是 hidden —— hidden 会让 body 变成滚动容器，顶栏的 sticky 就失效了。
  */
 body {
+  /* Geist 的几何字形替代字符，DESIGN.md 点名要开 */
+  font-feature-settings: "ss01", "ss02";
   overflow-x: clip;
 }
 
@@ -102,52 +147,54 @@ body {
 .lesson-body > * + * {
   margin-top: 1rem;
 }
-/*
- * 标题一律 600。DESIGN.md 把 600 定为 display 上限（"never 700 / 800"），
- * 整套字重压住之后，层级靠字号和留白拉开，读起来比原来的 700 冷静。
- */
 .lesson-body h2 {
-  margin-top: 2.5rem;
+  margin-top: 2.75rem;
+  padding-bottom: 0.625rem;
+  border-bottom: 1px solid var(--color-line);
   font-size: 1.375rem;
   font-weight: 600;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.03em;
   color: var(--color-ink);
-  border-bottom: 1px solid var(--color-hairline);
-  padding-bottom: 0.5rem;
 }
 .lesson-body h3 {
   margin-top: 1.75rem;
   font-size: 1.0625rem;
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
   color: var(--color-ink);
-}
-.lesson-body ul,
-.lesson-body ol {
-  padding-left: 1.5rem;
-}
-.lesson-body ul {
-  list-style: disc;
-}
-.lesson-body ol {
-  list-style: decimal;
-}
-.lesson-body li + li {
-  margin-top: 0.375rem;
 }
 .lesson-body strong {
   font-weight: 600;
   color: var(--color-ink);
 }
+/*
+ * 列表样式只作用于 MDX 产出的裸 ul/ol —— 交互组件内部自带 class 的列表
+ * （Terminal 的目标清单、Quiz 的选项）不能被套上项目符号和缩进。
+ */
+.lesson-body :is(ul, ol):not([class]) {
+  padding-left: 1.5rem;
+}
+.lesson-body ul:not([class]) {
+  list-style: outside;
+}
+.lesson-body ol:not([class]) {
+  list-style: decimal;
+}
+.lesson-body :is(ul, ol):not([class]) > li::marker {
+  color: var(--color-line-strong);
+}
+.lesson-body :is(ul, ol):not([class]) > li + li {
+  margin-top: 0.375rem;
+}
 .lesson-body a {
   color: var(--color-brand-600);
   text-decoration: underline;
   text-underline-offset: 2px;
-  text-decoration-color: var(--color-brand-200);
+  text-decoration-color: color-mix(in oklab, var(--color-brand-600) 35%, transparent);
   transition: text-decoration-color 0.15s;
 }
 .lesson-body a:hover {
-  text-decoration-color: var(--color-brand-600);
+  text-decoration-color: currentColor;
 }
 /*
  * 代码块。没标语言的 ``` 块 shiki 不会处理，拿不到 .shiki 类，
@@ -160,8 +207,9 @@ body {
   max-width: 100%;
   overflow-x: auto;
   overscroll-behavior-x: contain;
-  border: 1px solid var(--color-hairline);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-card);
+  font-family: var(--font-mono);
 }
 .lesson-body pre:not([class]) {
   background: var(--color-canvas);
@@ -172,11 +220,12 @@ body {
 }
 /* 行内代码——只作用于不在 pre 里的 code */
 .lesson-body :not(pre) > code {
-  background: var(--color-canvas-soft-2);
+  background: var(--color-soft-2);
   color: var(--color-ink);
+  font-family: var(--font-mono);
   padding: 0.1rem 0.35rem;
-  border-radius: 0.25rem;
-  font-size: 0.85em;
+  border-radius: var(--radius-xs);
+  font-size: 0.8em;
 }
 .lesson-body table {
   width: 100%;
@@ -189,27 +238,26 @@ body {
 }
 .lesson-body th,
 .lesson-body td {
-  border: 1px solid var(--color-hairline);
+  border: 1px solid var(--color-line);
   padding: 0.5rem 0.75rem;
   text-align: left;
   vertical-align: top;
 }
-/* 表头按 DESIGN.md 的 data-table 做法：mono 小字 + canvas-soft 底 */
 .lesson-body th {
-  background: var(--color-canvas-soft);
+  background: var(--color-soft);
   font-family: var(--font-mono);
   font-size: 0.75rem;
-  font-weight: 500;
+  font-weight: 400;
   color: var(--color-body);
   white-space: nowrap;
 }
 .lesson-body blockquote {
-  border-left: 2px solid var(--color-hairline-strong);
+  border-left: 2px solid var(--color-line-strong);
   padding-left: 1rem;
   color: var(--color-mute);
 }
 .lesson-body hr {
-  border-color: var(--color-hairline);
+  border-color: var(--color-line);
   margin: 2rem 0;
 }
 
@@ -241,8 +289,7 @@ body {
     margin-top: 1.5rem;
     font-size: 1rem;
   }
-  .lesson-body ul,
-  .lesson-body ol {
+  .lesson-body :is(ul, ol):not([class]) {
     padding-left: 1.25rem;
   }
   .lesson-body blockquote {
