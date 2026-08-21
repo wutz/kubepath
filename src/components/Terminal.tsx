@@ -140,29 +140,25 @@ export function Terminal({
   }
 
   return (
-    <section className="my-6 overflow-hidden rounded-xl border border-gray-800 bg-gray-900 shadow-lg">
-      <header className="flex items-center justify-between border-b border-gray-800 bg-gray-950 px-4 py-2">
-        <div className="flex items-center gap-1.5">
-          <span className="h-2.5 w-2.5 rounded-full bg-rose-500" />
-          <span className="h-2.5 w-2.5 rounded-full bg-amber-400" />
-          <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
-          <span className="ml-2 font-mono text-xs text-gray-400">{host}</span>
-        </div>
-        <span className="font-mono text-xs text-gray-500">
+    /* 深色面用 ink（DESIGN.md code-editor-mockup），内部分层靠黑色叠加 —— 与 storpath 一致 */
+    <section className="bg-ink shadow-float my-6 overflow-hidden rounded-md">
+      <header className="flex items-center justify-between border-b border-white/10 bg-black/30 px-4 py-2.5">
+        <span className="font-mono text-xs text-white/50">{host}</span>
+        <span className="font-mono text-xs text-white/40">
           目标 {doneGoals.length}/{goals.length}
         </span>
       </header>
 
       {goals.length > 0 && (
-        <ol className="border-b border-gray-800 bg-gray-950/60 px-4 py-2.5 text-xs text-gray-400">
+        <ol className="border-b border-white/10 bg-black/15 px-4 py-2.5 text-xs text-white/60">
           {goals.map((g, i) => {
             const done = doneGoals.includes(g.cmd)
             return (
               <li key={g.cmd} className="flex items-start gap-2 py-0.5">
-                <span className={done ? 'text-emerald-400' : 'text-gray-600'}>
+                <span className={`font-mono ${done ? 'text-brand-500' : 'text-white/30'}`}>
                   {done ? '✓' : `${i + 1}.`}
                 </span>
-                <span className={done ? 'text-gray-500 line-through' : ''}>{g.goal}</span>
+                <span className={done ? 'text-white/35 line-through' : ''}>{g.goal}</span>
               </li>
             )
           })}
@@ -183,17 +179,17 @@ export function Terminal({
             key={i}
             className={`whitespace-pre ${
               line.kind === 'input'
-                ? 'text-emerald-400'
+                ? 'text-brand-500'
                 : line.kind === 'system'
-                  ? 'text-sky-300'
-                  : 'text-gray-300'
+                  ? 'text-brand-100'
+                  : 'text-white/70'
             }`}
           >
             {line.kind === 'input' ? `${prompt} ${line.text}` : line.text}
           </pre>
         ))}
 
-        <div className="sticky left-0 flex items-center gap-2 text-emerald-400">
+        <div className="text-brand-500 sticky left-0 flex items-center gap-2">
           <span className="shrink-0">{prompt}</span>
           <input
             id={`term-${id}`}
@@ -204,7 +200,7 @@ export function Terminal({
             autoCapitalize="none"
             autoCorrect="off"
             enterKeyHint="go"
-            className="w-full min-w-32 bg-transparent text-gray-100 outline-none"
+            className="w-full min-w-32 bg-transparent text-white outline-none"
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') {
@@ -233,7 +229,7 @@ export function Terminal({
         </div>
       </div>
 
-      <footer className="border-t border-gray-800 bg-gray-950 px-4 py-1.5 font-mono text-[11px] text-gray-500">
+      <footer className="border-t border-white/10 bg-black/30 px-4 py-2 font-mono text-[11px] text-white/40">
         help 查看用法 · goals 看目标 · hint 要提示 · ↑↓ 翻历史
       </footer>
     </section>

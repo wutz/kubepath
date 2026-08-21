@@ -74,13 +74,12 @@ const STEPS: Step[] = [
   },
 ]
 
-const ACTOR_STYLE: Record<ComponentId, string> = {
-  apiserver: 'bg-indigo-100 text-indigo-700 border-indigo-300',
-  etcd: 'bg-sky-100 text-sky-700 border-sky-300',
-  controller: 'bg-emerald-100 text-emerald-700 border-emerald-300',
-  scheduler: 'bg-amber-100 text-amber-700 border-amber-300',
-  kubelet: 'bg-violet-100 text-violet-700 border-violet-300',
-}
+/*
+ * 原先五个组件各有一种颜色，但这个颜色只在"它正在动"的时候才用得上 ——
+ * 也就是说色相本身没编码任何信息。收成一种高亮样式，读起来反而更清楚：
+ * 有颜色的那个就是当前这一步的执行者。
+ */
+const ACTOR_ACTIVE = 'border-brand-600 bg-brand-50 text-brand-700'
 
 export function ApplyFlow() {
   const [at, setAt] = useState(0)
@@ -92,21 +91,19 @@ export function ApplyFlow() {
   const step = STEPS[at]
 
   return (
-    <section className="my-6 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
-      <header className="flex flex-wrap items-center justify-between gap-2 border-b border-gray-100 px-4 py-2.5">
-        <div className="flex items-center gap-2">
-          <span className="rounded bg-indigo-100 px-2 py-0.5 text-xs font-semibold text-indigo-700">
-            推演
-          </span>
-          <span className="font-mono text-xs text-gray-600">kubectl apply -f deploy.yaml</span>
+    <section className="bg-canvas shadow-card my-6 overflow-hidden rounded-md">
+      <header className="border-line flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
+        <div className="flex items-center gap-2.5">
+          <span className="eyebrow">推演</span>
+          <span className="text-body font-mono text-xs">kubectl apply -f deploy.yaml</span>
         </div>
-        <span className="text-xs text-gray-400">
+        <span className="text-mute font-mono text-[11px]">
           第 {at + 1} / {STEPS.length} 步
         </span>
       </header>
 
-      <div className="border-b border-gray-100 bg-gray-50 px-4 py-3">
-        <div className="text-[11px] text-gray-500">点组件可以把它「打挂」，看链路断在哪</div>
+      <div className="border-line bg-soft border-b px-4 py-3">
+        <div className="text-mute text-[11px]">点组件可以把它「打挂」，看链路断在哪</div>
         <div className="mt-2 flex flex-wrap gap-1.5">
           {COMPONENTS.map((comp) => {
             const isDown = down === comp.id
@@ -118,10 +115,10 @@ export function ApplyFlow() {
                 onClick={() => setDown(isDown ? null : comp.id)}
                 className={`rounded-lg border px-2.5 py-1.5 text-left text-xs transition ${
                   isDown
-                    ? 'border-rose-400 bg-rose-50 text-rose-700 line-through'
+                    ? 'border-danger bg-danger-soft/40 text-danger-deep line-through'
                     : isActor
-                      ? ACTOR_STYLE[comp.id]
-                      : 'border-gray-200 bg-white text-gray-500 hover:border-gray-400'
+                      ? ACTOR_ACTIVE
+                      : 'border-line bg-canvas text-mute hover:border-line-strong'
                 }`}
               >
                 <span className="block font-mono">{comp.label}</span>
@@ -132,7 +129,7 @@ export function ApplyFlow() {
         </div>
       </div>
 
-      <ol className="flex gap-1 border-b border-gray-100 px-4 py-2.5">
+      <ol className="border-line flex gap-1 border-b px-4 py-3">
         {STEPS.map((s, i) => {
           const reachable = brokenAt < 0 || i < brokenAt
           return (
@@ -144,17 +141,13 @@ export function ApplyFlow() {
                 title={s.title}
               >
                 <div
-                  className={`h-1.5 rounded-full transition ${
-                    !reachable
-                      ? 'bg-rose-200'
-                      : i <= at
-                        ? 'bg-indigo-500'
-                        : 'bg-gray-200'
+                  className={`h-1 rounded-full transition ${
+                    !reachable ? 'bg-danger-soft' : i <= at ? 'bg-brand-600' : 'bg-soft-2'
                   }`}
                 />
                 <span
-                  className={`mt-1 block truncate text-[10px] ${
-                    i === at ? 'font-medium text-gray-700' : 'text-gray-400'
+                  className={`mt-1.5 block truncate text-[10px] ${
+                    i === at ? 'text-ink font-medium' : 'text-mute'
                   }`}
                 >
                   {i + 1}. {s.title}
@@ -167,27 +160,25 @@ export function ApplyFlow() {
 
       <div className="px-4 py-4">
         <div className="flex flex-wrap items-center gap-2">
-          <span
-            className={`rounded border px-2 py-0.5 font-mono text-xs ${ACTOR_STYLE[step.actor]}`}
-          >
+          <span className={`rounded border px-2 py-0.5 font-mono text-xs ${ACTOR_ACTIVE}`}>
             {COMPONENTS.find((c) => c.id === step.actor)?.label}
           </span>
-          <h4 className="font-semibold text-gray-900">{step.title}</h4>
+          <h4 className="display-sm">{step.title}</h4>
         </div>
 
-        <p className="mt-2 text-sm leading-relaxed text-gray-600">{step.detail}</p>
+        <p className="text-body mt-2.5 text-sm leading-relaxed">{step.detail}</p>
 
         {blocked ? (
-          <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-sm">
-            <div className="font-medium text-rose-800">
+          <div className="border-danger-soft bg-danger-soft/30 mt-3 rounded-sm border px-3.5 py-3 text-sm">
+            <div className="text-danger-deep font-medium">
               {COMPONENTS.find((c) => c.id === down)?.label} 挂了，链路断在第 {brokenAt + 1} 步
             </div>
-            <p className="mt-1 leading-relaxed text-rose-700">{STEPS[brokenAt].stuck}</p>
+            <p className="text-body mt-1 leading-relaxed">{STEPS[brokenAt].stuck}</p>
           </div>
         ) : (
-          <div className="mt-3 rounded-lg bg-gray-50 px-3 py-2.5 text-sm">
-            <span className="text-xs font-medium text-gray-500">这一步之后：</span>
-            <span className="ml-1.5 text-gray-800">{step.state}</span>
+          <div className="bg-soft mt-3 rounded-sm px-3.5 py-3 text-sm">
+            <span className="text-mute text-xs">这一步之后：</span>
+            <span className="text-ink ml-1.5">{step.state}</span>
           </div>
         )}
 
@@ -196,7 +187,7 @@ export function ApplyFlow() {
             type="button"
             onClick={() => setAt((v) => Math.max(0, v - 1))}
             disabled={at === 0}
-            className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-700 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
+            className="bg-canvas text-ink shadow-card hover:shadow-float rounded-sm px-4 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40"
           >
             ← 上一步
           </button>
@@ -204,7 +195,7 @@ export function ApplyFlow() {
             type="button"
             onClick={() => setAt((v) => Math.min(STEPS.length - 1, v + 1))}
             disabled={at === STEPS.length - 1}
-            className="rounded-lg bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+            className="bg-brand-600 hover:bg-brand-700 disabled:bg-soft-2 disabled:text-mute rounded-sm px-4 py-1.5 text-sm font-medium text-white transition disabled:cursor-not-allowed"
           >
             下一步 →
           </button>
@@ -212,7 +203,7 @@ export function ApplyFlow() {
             <button
               type="button"
               onClick={() => setDown(null)}
-              className="ml-auto text-xs text-gray-400 transition hover:text-gray-700"
+              className="text-mute hover:text-ink ml-auto text-xs transition"
             >
               恢复所有组件
             </button>

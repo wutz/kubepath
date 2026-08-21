@@ -37,13 +37,6 @@ export interface Track {
   title: string
   subtitle: string
   goal: string
-  /** Tailwind 类名片段，用于阶段配色 */
-  accent: {
-    text: string
-    bg: string
-    border: string
-    dot: string
-  }
   lessons: Lesson[]
 }
 
@@ -54,12 +47,21 @@ export const KIND_LABEL: Record<LessonKind, string> = {
   planner: '规划',
 }
 
+/*
+ * 课程类型徽标，与 storpath 同一套映射：
+ * 「原理」是默认形态走中性，三种动手环节各占一个语义色。
+ * 阶段（L0–L4）不参与配色 —— 它的徽标一律中性，颜色这一维只留给类型与状态。
+ */
 export const KIND_STYLE: Record<LessonKind, string> = {
-  concept: 'bg-gray-100 text-gray-600',
-  lab: 'bg-emerald-100 text-emerald-700',
-  quest: 'bg-amber-100 text-amber-700',
-  planner: 'bg-violet-100 text-violet-700',
+  concept: 'bg-soft-2 text-body',
+  lab: 'bg-brand-50 text-brand-700',
+  quest: 'bg-warn-soft text-warn-deep',
+  planner: 'bg-plum-soft text-plum-deep',
 }
+
+/** 阶段徽标（L0–L4）：全站统一的中性小标签 */
+export const LEVEL_CHIP =
+  'rounded-xs bg-soft-2 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-body'
 
 /** k8s-in-action 手册里的具体章节，课程页按代码样式展示路径 */
 const repo = (path: string): LessonRef => ({ label: 'k8s-in-action', path })
@@ -74,12 +76,6 @@ export const tracks: Track[] = [
     title: '底座与前置',
     subtitle: '容器、节点与集群规划',
     goal: 'K8s 装在机器上，机器不合格集群就立不住。这一阶段解决三件事：容器到底是什么、节点要调成什么样、集群规模与命名怎么定。',
-    accent: {
-      text: 'text-sky-700',
-      bg: 'bg-sky-50',
-      border: 'border-sky-200',
-      dot: 'bg-sky-500',
-    },
     lessons: [
       {
         id: 'container-runtime',
@@ -215,12 +211,6 @@ export const tracks: Track[] = [
     title: '核心原理',
     subtitle: '控制面、对象与调度',
     goal: '所有排障最终都会回到这一层：一个对象写进 etcd 之后，是谁在看着它、把它变成节点上真实运行的进程。',
-    accent: {
-      text: 'text-indigo-700',
-      bg: 'bg-indigo-50',
-      border: 'border-indigo-200',
-      dot: 'bg-indigo-500',
-    },
     lessons: [
       {
         id: 'architecture',
@@ -385,12 +375,6 @@ export const tracks: Track[] = [
     title: '部署与运维',
     subtitle: '主战场：从装出来到扛得住',
     goal: '这一阶段是集群运维的主课：用 kubespray 把集群装出来，然后经历扩缩、升级、备份、节点故障这些必然会来的事。',
-    accent: {
-      text: 'text-emerald-700',
-      bg: 'bg-emerald-50',
-      border: 'border-emerald-200',
-      dot: 'bg-emerald-500',
-    },
     lessons: [
       {
         id: 'kubespray-deploy',
@@ -572,12 +556,6 @@ export const tracks: Track[] = [
     title: '平台能力',
     subtitle: '网络、存储与可观测性',
     goal: '裸集群交付不出去。这一阶段把网络、存储、监控和镜像分发接上，让平台真的能承载业务。',
-    accent: {
-      text: 'text-amber-700',
-      bg: 'bg-amber-50',
-      border: 'border-amber-200',
-      dot: 'bg-amber-500',
-    },
     lessons: [
       {
         id: 'cni-cilium',
@@ -767,12 +745,6 @@ export const tracks: Track[] = [
     title: '进阶战场',
     subtitle: 'GPU、AI 负载与规模化',
     goal: '把集群从「能跑业务」推到「能跑 AI 训练与推理、能给多个租户用、能算清账」。',
-    accent: {
-      text: 'text-violet-700',
-      bg: 'bg-violet-50',
-      border: 'border-violet-200',
-      dot: 'bg-violet-500',
-    },
     lessons: [
       {
         id: 'gpu-operator',
