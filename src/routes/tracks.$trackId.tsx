@@ -13,9 +13,9 @@ function TrackPage() {
 
   if (!track) {
     return (
-      <div className="rounded-xl border border-gray-200 bg-white px-6 py-10 text-center">
-        <p className="text-gray-500">没有这个阶段：{trackId}</p>
-        <Link to="/" className="mt-3 inline-block text-sm text-brand-600 hover:underline">
+      <div className="border-hairline bg-canvas shadow-card rounded-xl border px-6 py-12 text-center">
+        <p className="text-mute text-sm">没有这个阶段：{trackId}</p>
+        <Link to="/" className="text-brand-600 mt-3 inline-block text-sm hover:underline">
           返回学习路径
         </Link>
       </div>
@@ -29,29 +29,29 @@ function TrackPage() {
   const totalMinutes = track.lessons.reduce((sum, lesson) => sum + lesson.minutes, 0)
 
   return (
-    <div className="space-y-6">
-      <nav className="text-xs text-gray-400">
-        <Link to="/" className="hover:text-gray-700">
+    <div className="space-y-8">
+      <nav className="text-mute text-xs">
+        <Link to="/" className="hover:text-ink transition">
           学习路径
         </Link>
         <span className="mx-1.5">/</span>
-        <span className="text-gray-600">
+        <span className="text-body">
           {track.level} {track.title}
         </span>
       </nav>
 
-      <header className={`rounded-2xl border px-6 py-6 ${track.accent.border} ${track.accent.bg}`}>
+      <header>
         <div className="flex flex-wrap items-center gap-3">
           <span
-            className={`rounded-lg bg-white px-2.5 py-1 text-sm font-bold shadow-sm ${track.accent.text}`}
+            className={`rounded-md px-2 py-1 font-mono text-xs font-medium ${track.accent.chip}`}
           >
             {track.level}
           </span>
-          <h1 className="text-2xl font-bold">{track.title}</h1>
-          <span className="text-sm text-gray-500">{track.subtitle}</span>
+          <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">{track.title}</h1>
+          <span className="text-mute text-sm">{track.subtitle}</span>
         </div>
-        <p className="mt-3 max-w-3xl leading-relaxed text-gray-700">{track.goal}</p>
-        <div className="mt-4 flex flex-wrap gap-4 text-xs text-gray-600">
+        <p className="text-body mt-3 max-w-3xl leading-relaxed">{track.goal}</p>
+        <div className="text-mute mt-4 flex flex-wrap gap-4 font-mono text-[11px]">
           <span>
             {track.lessons.length} 节课 · 约 {Math.round(totalMinutes / 60)} 小时
           </span>
@@ -69,34 +69,36 @@ function TrackPage() {
               <Link
                 to="/learn/$trackId/$lessonId"
                 params={{ trackId: track.id, lessonId: lesson.id }}
-                className="block rounded-xl border border-gray-200 bg-white px-5 py-4 shadow-sm transition hover:border-brand-500 hover:shadow"
+                className="border-hairline bg-canvas shadow-card hover:shadow-card-lg hover:border-hairline-strong block rounded-xl border px-5 py-4 transition"
               >
                 <div className="flex flex-wrap items-center gap-2">
                   <span
-                    className={`flex h-6 w-6 items-center justify-center rounded-full text-[11px] font-medium ${
-                      done ? 'bg-emerald-500 text-white' : 'bg-gray-100 text-gray-500'
+                    className={`flex h-6 w-6 items-center justify-center rounded-full font-mono text-[11px] ${
+                      done ? 'bg-emerald-500 text-white' : 'bg-canvas-soft-2 text-mute'
                     }`}
                   >
                     {done ? '✓' : index + 1}
                   </span>
-                  <h2 className="font-semibold text-gray-900">{lesson.title}</h2>
-                  <span className={`rounded px-1.5 py-0.5 text-[11px] ${KIND_STYLE[lesson.kind]}`}>
+                  <h2 className="text-ink font-semibold tracking-tight">{lesson.title}</h2>
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${KIND_STYLE[lesson.kind]}`}
+                  >
                     {KIND_LABEL[lesson.kind]}
                   </span>
-                  <span className="text-xs text-gray-400">{lesson.minutes} 分钟</span>
+                  <span className="text-mute font-mono text-[11px]">{lesson.minutes} 分钟</span>
                   {lesson.status === 'planned' && (
-                    <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[11px] text-gray-400">
+                    <span className="bg-canvas-soft-2 text-mute rounded px-1.5 py-0.5 text-[11px]">
                       仅大纲
                     </span>
                   )}
                 </div>
 
-                <p className="mt-2 text-sm leading-relaxed text-gray-600">{lesson.summary}</p>
+                <p className="text-body mt-2.5 text-sm leading-relaxed">{lesson.summary}</p>
 
-                <ul className="mt-3 space-y-1 text-xs text-gray-500">
+                <ul className="text-mute mt-3 space-y-1 text-xs">
                   {lesson.objectives.map((objective) => (
-                    <li key={objective} className="flex gap-1.5">
-                      <span className="text-gray-300">→</span>
+                    <li key={objective} className="flex gap-2">
+                      <span className="text-hairline-strong">→</span>
                       {objective}
                     </li>
                   ))}
