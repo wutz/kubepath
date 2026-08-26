@@ -29,15 +29,15 @@
 
 | 阶段 | 主题 | 说明 |
 | --- | --- | --- |
-| **L0** `l0-container` | 容器与镜像 | 围绕 Docker：容器原理（namespace / cgroup / 镜像）、Docker 基础 |
-| **L1** `l1-basics` | K8s 基础与对象 | 围绕 kind：本地多节点集群、控制面解剖、声明式模型、工作负载对象、客户端工具、调度、kubelet 生命周期、运行时与 CRI、网络模型、RBAC |
+| **L0** `l0-container` | 容器与镜像 | 围绕 Docker：容器原理（namespace / cgroup / 镜像）、Docker 基础与 Docker–containerd 关系 |
+| **L1** `l1-basics` | K8s 基础与对象 | 围绕 kind：本地多节点集群、控制面解剖、声明式模型、工作负载对象、客户端工具、调度、kubelet 生命周期、运行时与 CRI（crictl / nerdctl / ctr）、网络模型、RBAC |
 | **L2** `l2-production` | 生产部署与组件选型 | 硬件拓扑、集群规划、容量计算器、节点 OS 基线、kubespray 部署与配置、组件选型总览、CNI、LB / Ingress / Gateway API、网络策略、PV/PVC/CSI、存储接入、PVC 闯关 |
 | **L3** `l3-platform-ops` | 配套组件与日常运维 | 可观测性、镜像仓库、节点与控制面运维、升级、etcd 备份恢复、NotReady 闯关、多租户、规模化、值班手册 |
 | **L4** `l4-ai` | AI 场景：GPU、训练与推理 | GPU Operator 与拓扑、高性能网络（InfiniBand / RoCE）、AI 负载调度（Volcano / Kueue）、训练与推理平台（Trainer / Ray / vLLM） |
 
 共 5 个阶段 **39 节课，全部已完成正文**，其中动手环节 17 节（14 个实验 + 2 个命令行闯关 +
-1 个规划计算器），另有 1 个嵌在《控制面解剖》里的 apply 推演。正文含 71 个随堂检查点、
-174 个提示框、4 个命令行演练。
+1 个规划计算器），另有 1 个嵌在《控制面解剖》里的 apply 推演。正文含 72 个随堂检查点、
+178 个提示框、4 个命令行演练。
 
 线上地址：<https://kubepath.wutz.dev>
 

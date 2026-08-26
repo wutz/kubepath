@@ -34,6 +34,28 @@ CRI 只有两个服务：
 这就是 shim 的作用。每个 Pod 一个 shim 进程，它常驻，持有容器的 stdio 和退出状态。好处是 **containerd 自己可以重启而不杀掉容器** —— 升级 containerd 不会导致业务中断。这也是为什么 `systemctl restart containerd` 通常是安全的，而 `systemctl restart kubelet` 也一样。
 </Callout>
 
+## dockershim 之前与之后
+
+这条链路曾经更长。1.24 之前，如果节点用的是 Docker，kubelet 要先经过一段叫 **dockershim** 的翻译代码：
+
+```
+1.24 之前（Docker 节点）
+kubelet → dockershim → dockerd → containerd → shim → runc
+                        ↑
+                两个多余的跳数，且 dockerd 一重启，链路就断
+
+1.24 之后
+kubelet → CRI → containerd → shim → runc
+```
+
+dockerd 从来不实现 CRI —— 它有自己的 API，于是 kubelet 里得内置一段专门伺候它的适配层。这段代码由 K8s 维护、随 kubelet 发版，成本高、故障面大，最终在 1.24 被删掉。
+
+要留意的是**删掉的是那段适配层，不是 Docker 生态**：
+
+- containerd 本来就是 Docker 公司拆分捐出的组件，两者是同一条链路的上下段，不是竞品
+- 镜像格式是 OCI 标准，`docker build` 出来的镜像 containerd 直接能跑，这一层从未变过
+- 变的只是**节点上不再需要 dockerd**，因此也就没有 `docker` 命令可用
+
 ## pause 容器与 Pod sandbox
 
 每个 Pod 起来时，第一个被创建的容器不是你写的那个，而是 **pause**：
@@ -87,10 +109,62 @@ crictl imagefsinfo                 # 镜像占用的磁盘
 crictl stats                       # 实时资源占用
 ```
 
-<Callout type="tip" title="别用 ctr，用 crictl">
-containerd 自带的 `ctr` 也能操作容器，但它**不认 namespace**。K8s 的容器都在 `k8s.io` 这个 containerd namespace 下，`ctr` 默认看的是 `default`，所以 `ctr containers ls` 常常什么都不显示。
+<Callout type="tip" title="containerd namespace ≠ K8s namespace">
+containerd 自己有一套 namespace，用来隔离不同调用方的容器与镜像 —— 和 K8s 的 Namespace 对象**完全是两回事**，只是重名。
 
-真要用 `ctr`，得显式带上：`ctr -n k8s.io containers ls`。日常还是用 `crictl` —— 它是照 CRI 语义设计的，输出和 kubectl 对得上。
+kubelet 建的所有东西都在 `k8s.io` 这个 containerd namespace 下：
+
+```bash
+ctr namespaces ls
+# NAME    LABELS
+# default            ← ctr / nerdctl 默认看这里，通常是空的
+# k8s.io             ← Pod 的容器和镜像都在这
+# moby               ← 如果这台机器上还装了 dockerd，它用这个
+```
+
+`crictl` 不需要操心这件事 —— 它只认 K8s 那一套。`ctr` 和 `nerdctl` 则必须显式带 `-n k8s.io`，否则会得出「节点上什么都没跑」的错误结论。
+</Callout>
+
+## 节点上的三个客户端：crictl、nerdctl、ctr
+
+节点上没有 `docker` 命令（1.24 之后不需要 dockerd），取而代之的是三个层次不同的工具：
+
+| 工具 | 来自 | 面向 | 什么时候用 |
+| --- | --- | --- | --- |
+| **crictl** | Kubernetes SIG-Node | CRI 语义：sandbox / 容器 / 镜像 | **节点排障的默认选择**，输出和 kubectl 对得上 |
+| **nerdctl** | containerd 项目 | Docker 兼容 CLI | 要 `build` / `run` / `compose` 那套手感时 |
+| **ctr** | containerd 自带 | 最底层的调试接口 | 前两个都拿不到信息时的兜底 |
+
+三者的常用命令对照：
+
+| 目的 | crictl | nerdctl（带 `-n k8s.io`） | ctr（带 `-n k8s.io`） |
+| --- | --- | --- | --- |
+| 列容器 | `crictl ps -a` | `nerdctl ps -a` | `ctr containers ls` |
+| 列 Pod / sandbox | `crictl pods` | 不区分 | 不区分 |
+| 看日志 | `crictl logs <id>` | `nerdctl logs <id>` | 不支持 |
+| 进容器 | `crictl exec -it <id> sh` | `nerdctl exec -it <id> sh` | `ctr tasks exec` |
+| 列镜像 | `crictl images` | `nerdctl images` | `ctr images ls` |
+| 拉镜像 | `crictl pull <img>` | `nerdctl pull <img>` | `ctr images pull` |
+| 构建镜像 | 不支持 | `nerdctl build`（需 buildkit） | 不支持 |
+
+```bash
+# 同一台节点上，三种视角看同一批容器
+crictl ps
+nerdctl -n k8s.io ps
+ctr -n k8s.io containers ls
+```
+
+<Callout type="warn" title="ctr 是「不带保险」的工具">
+`ctr` 直接操作 containerd，**不经过 CRI，也不通知 kubelet**。用它删掉一个容器，kubelet 会认为容器意外退出并按策略重建 —— 轻则重启，重则让排障现场消失。
+
+它的正确用途只有两类：看 containerd 自身的状态（namespace、snapshot、内容寻址存储），以及 crictl 也失灵时确认 containerd 还活着。**任何写操作都别用它。**
+</Callout>
+
+<Callout type="tip" title="nerdctl 在节点上最实用的两个场景">
+1. **验证私有仓库的凭据与网络** —— `nerdctl -n k8s.io pull harbor.internal/team/app:v1` 能带上 `--insecure-registry` 之类的参数逐个试，比反复改 Pod 重试快得多
+2. **临时起一个诊断容器** —— `nerdctl -n k8s.io run --rm -it --net host nicolaka/netshoot bash`，不占用 K8s 的资源账，也不会被调度器和探针干扰
+
+需要注意的是：这样起的容器 kubelet 不知道它的存在，用完记得清掉。
 </Callout>
 
 ## cgroup 驱动必须两边一致
@@ -155,7 +229,8 @@ crictl pull <image>
 ## 这一节的落点
 
 - kubelet → CRI → containerd → shim → runc，**四段链路，排障先定位在哪一段**
+- dockershim 移除的是那段适配层，**不是 Docker 生态** —— containerd 本就是 Docker 拆出来的，镜像也一直通用
 - pause 容器持有 namespace，所以业务容器重启 Pod IP 不变，`FailedCreatePodSandBox` 指向 CNI
-- 节点侧用 `crictl`（不是 `ctr`），kubectl 不可用时它是唯一的抓手
+- 节点侧默认用 `crictl`，要 docker 手感用 `nerdctl -n k8s.io`，`ctr` 只读不写
 - cgroup 驱动两边必须一致；GPU Pod 必须用 `resources.limits` 申请卡，别用 `NVIDIA_VISIBLE_DEVICES=all`
 - `crictl pull` 能一步区分「集群配置问题」和「节点到仓库的问题」
