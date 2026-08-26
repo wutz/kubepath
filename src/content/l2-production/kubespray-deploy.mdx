@@ -1,0 +1,504 @@
+kubeadm 能把集群装出来，但它只管到「节点 join 上了」。剩下的事情 —— 高可用入口、CNI、镜像源、证书有效期、节点内核参数 —— 都得你自己一台台做。
+
+kubespray 是一套 Ansible playbook，把这些都编排好了。它底下**仍然用 kubeadm**，所以出错时你要知道自己在看哪一层。
+
+这一节从环境准备一路走到验收清单，中间那段配置逐项拆解是重点 —— 同一份 playbook，配置写法决定了这套集群是能用两年，还是三个月后推倒重来。
+
+## 部署前：三件事必须先完成
+
+跑 playbook 之前，如果这三件没做完，装出来的集群早晚要返工：
+
+1. **机型已定** —— 控制面规格、计算节点盘位与网卡（见《硬件与拓扑》）
+2. **规划已定稿** —— 节点命名、三段网段、控制面节点数（见《集群规划与命名》）
+3. **节点 OS 基线已对齐** —— 内核模块、sysctl、swap、时间同步，以及 etcd 盘 `fio --fdatasync=1` 的 p99 < 3ms（见上一节《节点 OS 基线》）
+
+<Callout type="warn" title="Cilium 会占用几个路由表号">
+Cilium 会用 route table **200 / 202 / 2004 / 2005**。如果宿主机的网络配置（比如多网卡策略路由、RDMA 网络）也用了这些表号，会导致网络异常 —— 而且现象很难定位。
+
+装之前先在节点上确认：
+
+```bash
+ip rule list
+cat /etc/iproute2/rt_tables
+```
+有冲突就改宿主机的配置，这比事后查一个「偶发丢包」要便宜得多。
+</Callout>
+
+## 环境准备
+
+在一台能 **ssh 免密访问所有节点**的机器上操作（可以是控制面节点之一，也可以是单独的跳板机）：
+
+```bash
+export KUBESPRAY_VERSION="2.31.0"
+export UV_VERSION="0.11.7"
+```
+
+用 `uv` 管 Python 环境，比 `pip + virtualenv` 快得多：
+
+```bash
+# 装 uv
+wget https://file.mir.blsc.cn/uv/releases/${UV_VERSION}/uv-x86_64-unknown-linux-musl.tar.gz
+tar zxvf uv-x86_64-unknown-linux-musl.tar.gz
+cp uv-x86_64-unknown-linux-musl/* /usr/local/bin/
+
+# 配 PyPI 镜像
+mkdir -p ~/.config/uv
+cat << 'EOF' > ~/.config/uv/config.toml
+[[index]]
+url = "https://mirrors.ustc.edu.cn/pypi/simple"
+default = true
+EOF
+```
+
+```bash
+# 下载 kubespray 并装依赖
+wget https://file.mir.blsc.cn/kubespray/releases/kubespray-${KUBESPRAY_VERSION}.tar.gz
+tar zxvf kubespray-${KUBESPRAY_VERSION}.tar.gz
+cd kubespray-${KUBESPRAY_VERSION}
+
+export UV_PYTHON_INSTALL_MIRROR=https://file.mir.blsc.cn/uv/py/
+uv venv --python 3.12.12
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
+<Callout type="note" title="Ansible 版本必须和 kubespray 版本配套">
+`requirements.txt` 里的 ansible 版本是和这个 kubespray 版本一起测过的。用系统包管理器装的 ansible 大概率版本不对，症状是 playbook 跑到一半报某个 filter 或 module 不存在。
+
+始终用 venv + `requirements.txt`，别图省事用系统的 ansible。
+</Callout>
+
+## inventory：节点角色划分
+
+```ini
+# inventory/mycluster/inventory.ini
+[kube_control_plane]
+mn-192-168-3-21 ansible_host=192.168.3.21 etcd_member_name=etcd1
+mn-192-168-3-22 ansible_host=192.168.3.22 etcd_member_name=etcd2
+mn-192-168-3-23 ansible_host=192.168.3.23 etcd_member_name=etcd3
+
+[etcd:children]
+kube_control_plane
+
+[kube_node]
+cn-192-168-3-50 ansible_host=192.168.3.50
+cn-192-168-3-51 ansible_host=192.168.3.51
+```
+
+几个要点：
+
+| 项 | 说明 |
+| --- | --- |
+| `[etcd:children] kube_control_plane` | etcd 与控制面同机（stacked etcd），这是标准做法 |
+| `etcd_member_name` | **必须唯一**，是 etcd 集群里的成员标识 |
+| `ansible_host` | Ansible 用来 ssh 的地址 |
+| `ip=` | 节点有多网卡时，指定 K8s 服务绑哪个 IP |
+| 主机名 | 直接用规划好的 `mn-` / `cn-` / `gn-` 命名，装完就能从主机名读出角色和 IP |
+
+<Callout type="trap" title="nginx-proxy 报 ipwrap filter 错误：补 main_access_ip">
+一个真实踩过的坑。执行到写 nginx-proxy 配置这一步时报：
+
+```
+TASK [kubernetes/node : Nginx-proxy | Write nginx-proxy configuration]
+AnsibleFilterError: Unrecognized type <class 'AnsibleUndefined'> for ipwrap filter
+```
+
+原因是某些变量没被解析出来。解法是在 inventory 里补上 `main_access_ip`，值和 `ansible_host` 一致：
+
+```ini
+[kube_control_plane]
+mn-10-0-3-158 ansible_host=10.0.3.158 main_access_ip=10.0.3.158 ip=10.0.3.158 etcd_member_name=etcd1
+```
+</Callout>
+
+## 配置：先拿一份已验证的，再逐项改
+
+kubespray 的 `group_vars` 有几百个变量。从零调是浪费时间，正确做法是拿一份已经在生产上跑过的配置：
+
+```bash
+cp -r ~/k8s-in-action/k8s/kubespray/kubespray-${KUBESPRAY_VERSION}/inventory/mycluster inventory/
+```
+
+然后只改和这套集群相关的那些项。真正影响长期运维的就下面十几个变量 —— 它们的共同特点是**装完之后改不动，或者改起来很痛**。
+
+## group_vars 的组织
+
+```
+inventory/mycluster/
+├── inventory.ini              节点与角色
+├── credentials/               自动生成的证书密钥，别提交进 Git
+└── group_vars/
+    ├── all/
+    │   ├── all.yml            全局：负载均衡端口、NTP、代理
+    │   ├── containerd.yml     运行时与镜像源
+    │   ├── etcd.yml           etcd 数据目录与配额
+    │   └── offline.yml        离线部署的各种下载地址
+    └── k8s_cluster/
+        ├── k8s-cluster.yml    核心：网段、kube-proxy、DNS、版本
+        ├── addons.yml         随集群一起装的组件
+        ├── k8s-net-cilium.yml CNI 的详细参数
+        └── kube_control_plane.yml
+```
+
+## 网段：三个字段，装完改不了
+
+```yaml
+# group_vars/k8s_cluster/k8s-cluster.yml
+kube_service_addresses: 172.23.0.0/16     # Service CIDR
+kube_pods_subnet: 172.24.0.0/13           # Pod CIDR
+kube_network_node_prefix: 24              # 每节点分到 /24
+```
+
+这组配置对应的规模上限（《集群规划与命名》里算过）：
+
+| 字段 | 值 | 含义 |
+| --- | --- | --- |
+| `kube_pods_subnet` | `/13` | Pod 网络总空间 |
+| `kube_network_node_prefix` | `24` | 每节点 254 个 Pod IP |
+| 组合结果 | 2^(24−13) = **2048 个节点** | 上限 |
+| `kube_service_addresses` | `/16` | 约 65000 个 Service |
+
+<Callout type="trap" title="这三个字段是整份配置里最不可逆的">
+改它们意味着所有节点的 Pod 网络重划、所有 Service 重新分配 IP —— 等于重建集群。
+
+所以规划时按**三年后的规模**留一倍余量。`/13` 撑 2048 节点，比常见的 `/16`（256 节点）宽裕得多，而 Pod CIDR 用的是私有地址，放大不花钱。真正的成本是和公司现有网络规划撞段，所以这件事必须和网络团队一起定。
+
+另外注意 `kube_service_addresses` 不能和 `kube_pods_subnet` 重叠，也不能和节点网段、存储网段重叠。
+</Callout>
+
+## kube-proxy 模式
+
+```yaml
+kube_proxy_mode: ipvs           # 不要用默认的 iptables
+kube_proxy_strict_arp: true     # MetalLB 的 L2 模式要求这一项
+```
+
+L1《网络模型》讲过原因：iptables 是线性匹配，Service 多了之后数据面和控制面都会退化。`ipvs` 用内核哈希表，O(1) 查找。
+
+`kube_proxy_strict_arp: true` 是 MetalLB 在 L2 模式下的硬要求 —— 没有它，VIP 的 ARP 应答会混乱，表现是 LoadBalancer 的 IP 时通时不通。**即使现在还没装 MetalLB，也建议先开着**，免得以后要改 kube-proxy 再重启。
+
+## DNS：ndots 和 NodeLocal DNSCache
+
+```yaml
+dns_mode: coredns
+ndots: 2                        # 默认是 5
+enable_nodelocaldns: true       # 每节点一个 DNS 缓存
+nodelocaldns_ip: 169.254.25.10
+resolvconf_mode: host_resolvconf
+```
+
+这两项直接对应 L1 讲的 DNS 放大问题：
+
+- `ndots: 2` 把「解析外部域名要先拼三次 search 域」的开销降下来
+- `enable_nodelocaldns: true` 在每个节点起一个缓存，把重复查询挡在本地
+
+<Callout type="tip" title="这两项应该作为默认配置">
+它们对小集群没有坏处，对大集群是必需的。而且都属于「装的时候顺手开，之后要改就得动全集群 DNS」的类型。
+
+`ndots: 2` 有一个需要注意的场景：如果应用依赖「只写 Service 名、靠 search 域补全跨命名空间访问」（比如写 `mysql.other-ns` 期望补成 `mysql.other-ns.svc.cluster.local`），那 2 个点刚好够用。再降到 1 就会破坏这种写法。
+</Callout>
+
+## 镜像源：国内环境的关键
+
+```yaml
+# group_vars/all/containerd.yml
+containerd_registries_mirrors:
+  - prefix: docker.io
+    mirrors:
+      - host: https://mir.blsc.cn/v2/docker.io
+        capabilities: ["pull", "resolve"]
+        skip_verify: false
+        override_path: true
+  - prefix: registry.k8s.io
+    mirrors:
+      - host: https://mir.blsc.cn/v2/registry.k8s.io
+        capabilities: ["pull", "resolve"]
+        skip_verify: false
+        override_path: true
+  # gcr.io、ghcr.io、quay.io 同理
+```
+
+<Callout type="warn" title="镜像源配在 containerd 层，不是在 YAML 里改镜像名">
+两种做法的区别很大：
+
+- **改镜像名**（`image: mir.blsc.cn/xxx/nginx`）—— 侵入业务清单，换镜像源要改所有 YAML，而且第三方 Helm chart 改不动
+- **配 containerd mirror** —— 业务照常写 `nginx:1.27`，containerd 在拉取时自动替换。换源只改节点配置
+
+后者是唯一可持续的做法。`override_path: true` 这一项容易漏，它决定路径怎么拼 —— 不带的话某些镜像源会 404。
+</Callout>
+
+`containerd_discard_unpacked_layers: false` 也值得一提：设为 `true` 能省磁盘（丢掉解包后不再需要的原始层），但代价是 `crictl` 无法导出镜像、离线迁移镜像会失败。运维便利性通常比那点磁盘更值钱。
+
+## etcd
+
+```yaml
+# group_vars/all/etcd.yml
+etcd_data_dir: /var/lib/etcd
+etcd_deployment_type: host              # host 或 kubeadm（静态 Pod）
+etcd_quota_backend_bytes: "8589934592"  # 8GB
+```
+
+三项都很关键：
+
+| 字段 | 为什么这么配 |
+| --- | --- |
+| `etcd_data_dir` | 必须指向那块通过 fio 验收的独占 NVMe |
+| `etcd_deployment_type: host` | 以 systemd 服务跑，不依赖 kubelet —— kubelet 挂了 etcd 还活着，排障时更简单 |
+| `etcd_quota_backend_bytes` | **默认只有 2GB**，很容易撞上 |
+
+<Callout type="trap" title="默认 2GB 配额是个定时炸弹">
+etcd 用 MVCC，每次对象增删改都产生一个新 revision，历史版本会不断累积。默认 2GB 配额下，一个对象较多、变更频繁的集群几个月就会撞上：
+
+```
+etcdserver: mvcc: database space exceeded
+```
+
+一旦触发 NOSPACE alarm，etcd 进入维护模式 —— **只允许读和删除，拒绝所有写入**。表现是 apiserver 全面报错、Pod 调度不了、`kubectl apply` 全失败，看起来像整个集群挂了。
+
+装的时候就设成 8GB（官方建议上限）。已经装好的集群改法：
+
+```bash
+# 所有控制面节点都要改
+vim /etc/etcd.env
+ETCD_QUOTA_BACKEND_BYTES=8589934592
+systemctl restart etcd
+
+# 验证
+set -a && source /etc/etcd.env && set +a
+curl --cert $ETCDCTL_CERT --key $ETCDCTL_KEY --cacert $ETCDCTL_CACERT \
+  $ETCDCTL_ENDPOINTS/metrics | grep quota
+# etcd_server_quota_backend_bytes 8.589934592e+09
+```
+救火的具体操作在《etcd 运维》那一节。
+</Callout>
+
+## 高可用入口：kube-vip
+
+```yaml
+# group_vars/k8s_cluster/addons.yml
+kube_vip_enabled: true
+kube_vip_arp_enabled: true
+kube_vip_controlplane_enabled: true
+kube_vip_address: 192.168.3.101       # 这个 IP 不能被 DHCP 分配出去
+kube_vip_interface: eth0
+```
+
+kube-vip 在控制面节点上做 VIP 漂移：任一节点挂了，VIP 漂到活着的节点，`kubectl` 和 kubelet 的连接不断。
+
+三个要点：
+
+1. `kube_vip_address` 必须是**同网段内一个没被占用、也不会被 DHCP 分配**的地址
+2. `kube_vip_interface` 要填实际承载该网段的网卡名（多网卡机器容易填错）
+3. kubeconfig 和所有节点的 kubelet 都必须通过这个 VIP 访问 apiserver
+
+## addons：哪些该开，哪些自己管
+
+```yaml
+helm_enabled: false
+metrics_server_enabled: false
+cert_manager_enabled: false
+metallb_enabled: false
+ingress_alb_enabled: false
+gateway_api_enabled: false
+node_feature_discovery_enabled: false
+local_path_provisioner_enabled: false
+```
+
+上面这份配置里几乎全是 `false`，只开了 kube-vip。这不是偷懒，是刻意的。
+
+<Callout type="tip" title="为什么把 addons 都关掉，自己用 Helm 管">
+kubespray 装的 addon 有三个问题：
+
+1. **版本被 kubespray 版本绑定** —— 想升级 cert-manager 到新版本，得等 kubespray 支持
+2. **配置能力有限** —— 只暴露 kubespray 定义的那几个变量，chart 的其它 values 改不了
+3. **升级集群时会连带动它们** —— 跑 `upgrade-cluster.yml` 可能把 addon 一起改了，风险面变大
+
+唯一的例外是 **kube-vip**：它是控制面高可用的一部分，必须在集群起来的同时就位，不能事后装。
+
+其余组件用 Helm / Helmwave 独立管理，各自有自己的版本和升级节奏。这样「升级 K8s」和「升级 Ingress」是两件独立的事，不会互相牵连。
+</Callout>
+
+## 其它几项
+
+```yaml
+# group_vars/all/all.yml
+loadbalancer_apiserver_port: 6443
+loadbalancer_apiserver_healthcheck_port: 8081
+ntp_enabled: false              # 通常在 OS 基线里用 systemd-timesyncd 管
+```
+
+```yaml
+# k8s-cluster.yml
+container_manager: containerd
+kube_proxy_strict_arp: true
+kube_encrypt_secret_data: false     # 开了会加密 etcd 里的 Secret，但要管密钥轮转
+kubernetes_audit: false             # 审计日志：合规场景要开，注意日志量
+kube_log_level: 2
+k8s_image_pull_policy: IfNotPresent
+```
+
+`kube_encrypt_secret_data` 和 `kubernetes_audit` 是两个「有合规需求就必须开、开了就要配套运维」的开关：前者要管加密密钥的存储与轮转，后者要规划审计日志的落盘与采集（日志量可能很大）。**建议装的时候就定，事后开需要重启 apiserver 并处理已有数据。**
+
+## 执行部署
+
+```bash
+source .venv/bin/activate
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root cluster.yml
+```
+
+一套三控制面 + 若干工作节点的集群，通常 20–40 分钟。
+
+<Callout type="tip" title="playbook 失败了直接重跑，这是设计如此">
+Ansible 的 task 基本都是幂等的，kubespray 也按这个原则写。所以中途失败（网络抖动、镜像拉取超时）**直接重跑同一条命令**就行，已完成的步骤会被跳过。
+
+不要「手工补一下再继续」—— 手工做的那步不会被记录，下次重跑或升级时状态就不一致了。
+
+如果反复失败在同一个 task 上，加 `-vvv` 看完整报错，那是真问题。
+</Callout>
+
+## 拿 kubeconfig
+
+装完后从**第一个控制面节点**拿：
+
+```bash
+scp mn-192-168-3-21:/root/.kube/config ~/.kube/config
+```
+
+然后把 `server` 地址改成 VIP —— 这一步很关键：
+
+```yaml
+clusters:
+  - cluster:
+      server: https://192.168.3.101:6443    # kube_vip_address，不是某台节点的 IP
+```
+
+直接用节点 IP 的话，那台节点一维护，你的 kubectl 就断了。
+
+## 部署后验收清单
+
+装完别急着交付，逐项确认：
+
+```bash
+# 1. 所有节点 Ready
+kubectl get node -o wide
+
+# 2. 控制面组件全部 Running
+kubectl -n kube-system get pod
+
+# 3. etcd 健康，成员数正确
+kubectl -n kube-system exec -it etcd-mn-192-168-3-21 -- sh -c '
+  ETCDCTL_API=3 etcdctl --cert=/etc/ssl/etcd/ssl/... member list -w table'
+
+# 4. CoreDNS 能解析
+kubectl run -it --rm dns --image=busybox:1.36 -- nslookup kubernetes.default
+
+# 5. Pod 跨节点互通
+kubectl run -it --rm net --image=nicolaka/netshoot -- ping <另一节点上的 Pod IP>
+
+# 6. 证书有效期
+kubeadm certs check-expiration
+
+# 7. 关掉一台控制面，确认 kubectl 仍可用（VIP 漂移生效）
+```
+
+第 7 项最容易被跳过，但它是唯一能验证「高可用真的成立」的方法。装完就测，比出事时才发现 VIP 没配对好得多。
+
+## 改完配置怎么安全重跑
+
+全量重跑要几十分钟，而且动的面很大。改一处配置时按这个顺序来：
+
+```bash
+# 1. 先只看会改什么，不真改（部分 task 支持）
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root cluster.yml --check --diff
+
+# 2. 看有哪些 tag 可用，只跑相关的那个
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root cluster.yml --list-tags
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root cluster.yml --tags=coredns
+
+# 3. 涉及控制面的改动，先在一台上验证
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root cluster.yml --limit=mn-192-168-3-21
+```
+
+<Callout type="warn" title="inventory 目录必须进 Git">
+`inventory/mycluster/` 是这套集群的**唯一事实来源**。它不进版本库的话：
+
+- 没人知道当前配置和上次有什么不同
+- 换个人接手就得从集群里反向推配置
+- 出事时无法回滚到上一个已知可用的配置
+
+例外是 `credentials/` 目录（自动生成的证书密钥），加进 `.gitignore`，另外用密钥管理系统保管。
+</Callout>
+
+## 扩容节点
+
+```bash
+# 1. 把新节点加进 inventory 的 [kube_node]
+# 2. 刷新 facts
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root playbooks/facts.yml
+# 3. 只对新节点跑 scale.yml
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root scale.yml --limit=cn-192-168-3-52
+```
+
+<Callout type="warn" title="scale.yml 只用于工作节点">
+扩控制面**不能用 `scale.yml`** —— 它不会正确处理 etcd 成员变更，可能搞坏 etcd 集群。控制面扩缩要用 `recover-control-plane.yml`，详见《控制面扩缩与证书轮转》那一节。
+
+`--limit` 也别忘：不加的话 playbook 会遍历所有节点，虽然幂等但很慢，而且增加了动到存量节点的风险。
+</Callout>
+
+## 卸载
+
+```bash
+ansible-playbook -i inventory/mycluster/inventory.ini -b -u=root reset.yml
+```
+
+`reset.yml` 会清掉 K8s 相关的一切：容器、配置、CNI 网络、iptables 规则、etcd 数据。**它不做确认提示**，跑错 inventory 就是一次全集群删除 —— 执行前务必确认 `-i` 指向的是哪套集群。
+
+<Quiz
+  id="deploy-1"
+  question="cluster.yml 跑到一半因为镜像拉取超时失败了。最合适的处理是？"
+  options={[
+    { text: '直接重跑同一条命令，已完成的步骤会被跳过', correct: true },
+    { text: '手工在失败的节点上把镜像拉下来，然后跳过这个 task 继续', feedback: '手工做的步骤不会被记录，集群状态与 playbook 的认知就不一致了 —— 下次重跑或升级时会以别的方式暴露出来。' },
+    { text: '先跑 reset.yml 清干净再从头装', feedback: '代价太大。Ansible 的 task 是幂等的，本来就支持断点重跑。' },
+    { text: '改成串行执行再重跑', feedback: '并发不是失败的原因，镜像源才是。真要治本是配好 containerd 的 registry mirror。' },
+  ]}
+  explain={<>幂等是 Ansible 的核心特性，kubespray 也按这个原则设计 —— 中途失败重跑是<strong>预期的使用方式</strong>。要避免的是手工介入：手工补的那一步游离在自动化之外，会让集群实际状态和 playbook 的假设产生偏差，这类偏差往往在下一次升级时才爆出来。如果同一个 task 反复失败，用 <code>-vvv</code> 看完整报错，那才是真问题。</>}
+/>
+
+<Quiz
+  id="vars-1"
+  question="集群跑了半年后报 etcdserver: mvcc: database space exceeded，kubectl apply 全部失败。根本原因和预防措施是？"
+  options={[
+    { text: 'etcd_quota_backend_bytes 默认只有 2GB，MVCC 历史版本累积撞上配额；装的时候就该设成 8GB', correct: true },
+    { text: 'etcd 磁盘满了，扩盘就行', feedback: '这是 etcd 的逻辑配额，不是文件系统空间。盘可能还很空，但 etcd 自己拒绝写入了。' },
+    { text: 'etcd 版本太老，升级解决', feedback: '与版本无关，是配额机制本身的行为。' },
+    { text: '对象太多，删一些 Pod 就好', feedback: '删对象反而会产生新的 revision。要真正释放空间必须 compact + defrag。' },
+  ]}
+  explain={<>etcd 的 MVCC 会为每次变更保留历史版本，2GB 默认配额在变更频繁的集群里几个月就撞上。触发后进入 NOSPACE 维护模式，<strong>只读和删，拒绝写入</strong> —— 看起来像整个集群挂了。装的时候设 8GB 是零成本的预防；已经触发的话要 <code>etcdctl compact</code> + <code>defrag</code> + <code>alarm disarm</code>，具体见《etcd 运维》。顺手一提：<code>ttlSecondsAfterFinished</code> 没配的 CronJob 是对象膨胀的常见来源。</>}
+/>
+
+<Quiz
+  id="vars-2"
+  question="关于 addons.yml 里把组件都设成 false、改用 Helm 独立管理，下面哪些是合理的理由？"
+  options={[
+    { text: 'addon 版本会被 kubespray 版本绑定，无法独立升级', correct: true },
+    { text: 'kubespray 只暴露有限的变量，chart 的其它 values 改不了', correct: true },
+    { text: '升级集群时会连带改动 addon，扩大了变更风险面', correct: true },
+    { text: 'kube-vip 也应该关掉，用 Helm 装', feedback: 'kube-vip 是例外 —— 它是控制面高可用的组成部分，必须在集群起来的同时就位，没法事后装。' },
+  ]}
+  explain={<>核心是<strong>解耦变更节奏</strong>：「升级 K8s」和「升级 Ingress」应该是两件独立的事。kubespray 管的 addon 会把这两件事绑在一起，每次集群升级都要顺带评估一堆组件的兼容性。kube-vip 是唯一的例外，因为它是集群可访问性的前提条件。</>}
+/>
+
+## 这一节的落点
+
+- kubespray 底下是 kubeadm，出错时要分清是编排层还是 kubeadm 层的问题
+- 装之前先完成三件事：**机型定型、规划定稿、OS 基线与 etcd 盘验收**
+- 用 venv + `requirements.txt` 装 ansible；配置从一份已验证的 `group_vars` 起步
+- **三个网段字段装完改不了**，按三年规模留一倍余量
+- `kube_proxy_mode: ipvs` + `strict_arp: true`；`ndots: 2` + NodeLocal DNSCache 当默认配置
+- 镜像源配在 **containerd 层**，别去改业务 YAML 里的镜像名
+- **`etcd_quota_backend_bytes` 默认 2GB 是定时炸弹**，装的时候就设 8GB
+- addon 全关、用 Helm 独立管，唯一例外是 kube-vip
+- **失败直接重跑，不要手工补步骤**；kubeconfig 的 server 要指向 VIP
+- 验收清单里第 7 项（关掉一台控制面）是唯一能验证高可用的方法
+- `inventory/` 目录进 Git（`credentials/` 除外）；`reset.yml` 无确认提示，执行前确认 inventory

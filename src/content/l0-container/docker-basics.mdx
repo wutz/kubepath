@@ -1,0 +1,301 @@
+上一节讲清了容器是什么。这一节把它变成手上的动作：写一个 Dockerfile、构建出镜像、跑起来、进去看一眼、把日志捞出来。
+
+为什么在一门 K8s 教程里还讲 Docker？因为**镜像是 K8s 唯一的交付物**。集群再熟，镜像做不好照样天天出事：拉不动、起不来、跑起来是 root、改一行代码重新构建要八分钟。而这些手感，用 Docker 练最快。
+
+## docker run 背后发生了什么
+
+```bash
+docker run -d --name web -p 8080:80 nginx:1.27-alpine
+```
+
+这一条命令做了五件事：
+
+1. 本地没有 `nginx:1.27-alpine` 就去 registry 拉，逐层下载并解压到本地存储
+2. 用这些只读层叠出一个 rootfs，最上面加一个可写层
+3. 建一组 namespace（mnt / pid / net / uts / ipc）
+4. 建 cgroup，把资源限制写进去
+5. 在这套环境里 `exec` 镜像声明的启动进程
+
+对照上一节的心智模型：第 2 步是 OverlayFS，第 3、4 步就是 namespace 与 cgroup。**Docker 本身不隔离任何东西，它只是把内核能力包装成了一条命令。**
+
+## 日常命令地图
+
+| 目的 | 命令 | 到了 K8s 里对应什么 |
+| --- | --- | --- |
+| 起一个容器 | `docker run` | `kubectl run` / Deployment |
+| 看在跑什么 | `docker ps -a` | `kubectl get pod` |
+| 看日志 | `docker logs -f web` | `kubectl logs -f` |
+| 进去看看 | `docker exec -it web sh` | `kubectl exec -it` |
+| 看完整状态 | `docker inspect web` | `kubectl describe pod` |
+| 看资源用量 | `docker stats` | `kubectl top pod` |
+| 拷文件进出 | `docker cp web:/etc/nginx/nginx.conf .` | `kubectl cp` |
+
+这张对应表值得记住：**K8s 的排障命令几乎是 Docker 命令的分布式版本**，差别在于对象从「一台机器上的容器」变成了「集群里的 Pod」。
+
+<Callout type="tip" title="排障顺序：logs → describe/inspect → exec">
+不管在 Docker 还是 K8s，顺序都是一样的：先看进程自己说了什么（logs），再看平台说了什么（inspect / describe），最后才进容器里翻（exec）。
+
+反过来做 —— 一上来就 `exec` 进去 —— 常见的结果是容器已经退出了，根本进不去。而这时候 `logs` 里那行退出原因一直躺在那儿。
+</Callout>
+
+## Dockerfile：每一行都是一层
+
+```dockerfile
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download                      # 依赖单独一层，代码改动不会让它失效
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/app ./cmd/app
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=build /out/app /usr/local/bin/app
+USER 65532:65532                         # 非 root 运行
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/app"]
+```
+
+这份模板里有三个刻意的设计：
+
+- **先 `COPY go.mod` 再 `COPY .`** —— 构建缓存按层命中，依赖层和代码层分开，改一行业务代码就不用重新拉依赖
+- **多阶段构建** —— 编译工具链留在 `build` 阶段，最终镜像里只有一个二进制，从几百 MB 降到十几 MB
+- **`USER` 非 root** —— K8s 里配 `runAsNonRoot: true` 的时候，镜像本身就得先具备这个条件
+
+<Callout type="trap" title="ENTRYPOINT 用 shell 形式，SIGTERM 就送不到进程">
+两种写法的差别不是风格问题：
+
+```dockerfile
+ENTRYPOINT /usr/local/bin/app        # shell 形式：实际是 /bin/sh -c "..."，PID 1 是 sh
+ENTRYPOINT ["/usr/local/bin/app"]    # exec 形式：PID 1 就是你的进程
+```
+
+shell 形式下 PID 1 是 `sh`，它不会把 `SIGTERM` 转发给子进程。于是 `kubectl delete pod` 发出的优雅终止信号被吞掉，等满 30 秒被 `SIGKILL` 强杀 —— 表现就是「删 Pod 特别慢」「滚动更新期间总掉几个请求」。
+
+**永远用 exec 形式（JSON 数组）写 ENTRYPOINT 和 CMD。**
+</Callout>
+
+## 镜像瘦身：为什么值得较真
+
+镜像大小直接换算成集群里的三笔账：节点拉取时间、节点磁盘占用、扩容响应速度。一个 1.2G 的镜像在一个 50 节点的集群里滚动一次，是 60G 的网络流量。
+
+几条见效最快的：
+
+```bash
+# 1. 基础镜像选小的：alpine / distroless / scratch
+# 2. .dockerignore 挡掉 .git、node_modules、本地构建产物
+cat > .dockerignore <<'EOF'
+.git
+node_modules
+dist
+*.log
+EOF
+
+# 3. 合并 RUN 并在同一层清理缓存 —— 分层写清理是无效的
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 4. 看清楚每一层多大
+docker history myapp:v1 --no-trunc
+```
+
+<Callout type="warn" title="分层删除删不掉体积">
+
+```dockerfile
+RUN wget https://example.com/big.tar.gz   # 这一层 +800MB
+RUN rm big.tar.gz                          # 这一层删掉了，但 800MB 还在镜像里
+```
+
+镜像层是只读叠加的，后一层的删除只是在上层做了个「白障」标记，底下那 800MB 依然要下载、依然占磁盘。**下载、解压、清理必须在同一个 `RUN` 里完成。**
+</Callout>
+
+## 上机演练
+
+<Terminal
+  id="docker-basics-flow"
+  host="root@dev-10-243-144-51"
+  intro={`模拟终端：构建一个镜像并跑起来，中途遇到一个起不来的容器。
+输入 goals 看目标，hint 要提示。`}
+  commands={[
+    {
+      cmd: 'docker build -t demo-api:v1 .',
+      goal: '构建镜像，观察分层与缓存',
+      hint: '注意每个 step 对应 Dockerfile 的一行。',
+      output: `[+] Building 24.3s (14/14) FINISHED
+ => [build 1/6] FROM docker.io/library/golang:1.23-alpine          4.1s
+ => CACHED [build 3/6] COPY go.mod go.sum ./
+ => CACHED [build 4/6] RUN go mod download
+ => [build 5/6] COPY . .                                            0.3s
+ => [build 6/6] RUN CGO_ENABLED=0 go build -o /out/app ./cmd/app   17.2s
+ => [stage-1 3/3] COPY --from=build /out/app /usr/local/bin/app     0.1s
+ => exporting to image                                              0.4s
+ => => naming to docker.io/library/demo-api:v1`,
+    },
+    {
+      cmd: 'docker images demo-api',
+      goal: '确认多阶段构建的效果',
+      hint: '和 golang 基础镜像 300MB+ 比一比。',
+      output: `REPOSITORY   TAG   IMAGE ID       CREATED          SIZE
+demo-api     v1    8f2a91c4d3e7   12 seconds ago   14.8MB`,
+    },
+    {
+      cmd: 'docker run -d --name api -p 8080:8080 demo-api:v1',
+      goal: '把它跑起来',
+      hint: '-d 后台跑，-p 做端口映射。',
+      output: `c1d9f0b7a2e5486fbd3c77a1e0b4f9d2`,
+    },
+    {
+      cmd: 'docker ps -a --filter name=api',
+      goal: '确认状态 —— 这里会发现它没起来',
+      hint: 'STATUS 列比 docker run 的返回值可信。',
+      output: `CONTAINER ID   IMAGE          COMMAND                  STATUS                     PORTS     NAMES
+c1d9f0b7a2e5   demo-api:v1    "/usr/local/bin/app"     Exited (1) 3 seconds ago             api`,
+    },
+    {
+      cmd: 'docker logs api',
+      goal: '先看进程自己说了什么',
+      hint: '排障第一步永远是 logs，不是 exec。',
+      output: `2026/08/26 10:14:02 starting demo-api v1
+2026/08/26 10:14:02 fatal: open /etc/demo/config.yaml: no such file or directory`,
+    },
+    {
+      cmd: 'docker run -d --name api2 -p 8080:8080 -v /opt/demo:/etc/demo:ro demo-api:v1',
+      goal: '挂上配置再跑一次',
+      hint: '-v 挂目录进去，只读用 :ro。K8s 里对应 ConfigMap 挂载。',
+      output: `a7e3b1c9d5f24081ac6e2b8f0d4c7391`,
+    },
+    {
+      cmd: 'docker exec -it api2 wget -qO- localhost:8080/healthz',
+      goal: '在容器内部验证服务确实活着',
+      hint: '先在容器内验，再去宿主机验，这样能分清是应用问题还是端口映射问题。',
+      output: `{"status":"ok","version":"v1"}`,
+    },
+  ]}
+/>
+
+这一串演练里，`Exited (1)` → `docker logs` → 补上挂载 的排查路径，和 K8s 里 `CrashLoopBackOff` → `kubectl logs --previous` → 补上 ConfigMap 是同一件事。
+
+## Docker、containerd 与 K8s 的关系
+
+很多人以为 Docker 是一个整体的程序，其实 `docker run` 敲下去之后，请求要穿过四层：
+
+```
+docker CLI            你敲的命令，一个 HTTP 客户端
+  │  REST over /var/run/docker.sock
+  ▼
+dockerd               Docker Engine 守护进程：镜像构建、网络、卷、compose 这些「上层功能」
+  │  gRPC
+  ▼
+containerd            容器生命周期与镜像管理的核心
+  │
+  ▼
+containerd-shim → runc   真正建 namespace、写 cgroup、exec 用户进程
+```
+
+**containerd 本来就是 Docker 拆出来的那一半** —— 2017 年 Docker 把容器运行时这一层独立成项目捐给 CNCF，自己保留上层的构建、网络、compose 那些开发者功能。所以两者不是竞品关系，而是同一条链路的上下两段。
+
+这解释了一个常被误解的说法：
+
+| 说法 | 实情 |
+| --- | --- |
+| 「K8s 弃用了 Docker」 | 弃用的是 **dockershim** —— kubelet 里那段专门适配 dockerd 的翻译代码 |
+| 「Docker 造的镜像 K8s 不认了」 | 镜像是 OCI 标准，一直通用。Docker 构建、containerd 运行完全没问题 |
+| 「本地开发也不能用 Docker 了」 | 完全能用。构建、调试、compose 这些场景 Docker 依然最顺手 |
+
+K8s 1.24 移除 dockershim 之后，kubelet 直接通过 CRI 和 containerd 对话，中间少了 dockerd 这一跳 —— 少一个守护进程、少一层翻译。链路细节在 L1《运行时与 CRI》展开。
+
+<Callout type="note" title="生产节点上没有 docker 命令，怎么办">
+装好的生产集群节点上通常只有 containerd，没有 dockerd，也就没有 `docker` 命令。这时候有三个客户端可选：
+
+- **`crictl`** —— 按 CRI 语义设计，看 Pod / sandbox / 容器，是节点排障的主力
+- **`nerdctl`** —— containerd 官方的 Docker 兼容 CLI，命令几乎一一对应
+- **`ctr`** —— containerd 自带的底层调试工具，功能最原始
+
+日常排障用 `crictl`；需要 `docker` 那套手感（build、run、compose）时用 `nerdctl`。三者的分工在 L1《运行时与 CRI》里有对照表。
+</Callout>
+
+## nerdctl：把 docker 的手感带到 containerd 上
+
+[nerdctl](https://github.com/containerd/nerdctl) 是 containerd 项目自己维护的 CLI，设计目标就是**和 docker 命令兼容**。上面练的那些命令，绝大多数原样就能用：
+
+```bash
+nerdctl run -d --name web -p 8080:80 nginx:1.27-alpine
+nerdctl ps -a
+nerdctl logs -f web
+nerdctl exec -it web sh
+nerdctl build -t demo-api:v1 .          # 需要 buildkit
+nerdctl compose up -d                    # compose 也支持
+```
+
+熟悉之后可以直接 `alias docker=nerdctl`，肌肉记忆完全不用改。
+
+它相比 docker 还多了几样 K8s 场景用得上的东西：镜像懒加载（lazy-pulling，大镜像可以边拉边跑）、镜像加密、以及原生的 rootless 模式。
+
+<Callout type="warn" title="nerdctl 在节点上要带 --namespace k8s.io">
+containerd 用 namespace 隔离不同调用方的资源，K8s 的容器和镜像都在 `k8s.io` 这个 namespace 下，而 nerdctl 默认用 `default`。
+
+```bash
+nerdctl ps                        # 空的 —— 看的是 default namespace
+nerdctl --namespace k8s.io ps     # 这才是 Pod 里的容器
+nerdctl -n k8s.io images          # 节点上 K8s 用的镜像
+```
+
+忘了这个参数，就会得出「节点上什么都没跑」的错误结论。这也是节点排障优先用 `crictl` 的原因之一 —— 它只看 K8s 的那个 namespace，不会认错地方。
+</Callout>
+
+<Callout type="note" title="哪些概念能带进 K8s，哪些不能">
+**能带过去的**：镜像与分层、ENTRYPOINT/CMD、环境变量、挂载卷、资源限制 —— 这些在 K8s 里都有一一对应的字段。
+
+**带不过去的**：`docker run` 的一次性心智（K8s 是声明式的，你描述期望状态而不是执行动作）、`--link` 与 docker 自带网络（K8s 有自己的网络模型）、`docker-compose` 的编排语义（对应 Deployment + Service，但调度、扩缩、自愈完全不同）。
+</Callout>
+
+<Quiz
+  id="docker-1"
+  question="一个 Go 服务的镜像 1.1GB，团队想瘦身。以下哪个改动收益最大？"
+  options={[
+    {
+      text: '改成多阶段构建，最终镜像只放编译产物和 ca-certificates',
+      correct: true,
+    },
+    { text: '在最后加一行 RUN rm -rf /root/.cache /tmp/*', feedback: '分层删除删不掉体积 —— 前面层里的文件依然要下载和占盘，只是被上层的白障标记挡住了。' },
+    { text: '把 apt install 拆成多个 RUN，让缓存更容易命中', feedback: '拆开只会增加层数，反而更大。合并 RUN 并在同层清理才是对的方向。' },
+    { text: '给镜像打更多 tag，方便节点复用', feedback: 'tag 只是同一份内容的别名，不改变任何体积。' },
+  ]}
+  explain={<>1.1GB 的绝大部分是 <code>golang</code> 基础镜像里的编译工具链，而运行一个静态编译的 Go 二进制根本不需要它。多阶段构建把编译环境留在第一阶段，最终镜像从 <code>alpine</code> 或 <code>distroless</code> 起步只放二进制，通常能压到 15–30MB —— 一个数量级的差距，其它优化都追不上。</>}
+/>
+
+<Quiz
+  id="docker-2"
+  question="Dockerfile 里写 ENTRYPOINT /app/server，部署到 K8s 后发现每次删 Pod 都要等满 30 秒。最可能的原因？"
+  options={[
+    {
+      text: 'shell 形式的 ENTRYPOINT 让 PID 1 变成 sh，SIGTERM 没被转发给业务进程',
+      correct: true,
+    },
+    { text: 'terminationGracePeriodSeconds 设得太长', feedback: '30 秒是默认值。问题不是这个值大，而是进程在 30 秒内根本没响应信号，最后被 SIGKILL。' },
+    { text: '节点上 containerd 的停止超时配置有问题', feedback: '如果是运行时层面的问题，所有 Pod 都会慢，而不只是这一个镜像。' },
+    { text: 'preStop hook 没配', feedback: 'preStop 是可选的额外动作。正常情况下不配它也应该在 SIGTERM 后立即退出。' },
+  ]}
+  explain={<>shell 形式的 <code>ENTRYPOINT cmd</code> 实际执行的是 <code>/bin/sh -c "cmd"</code>，PID 1 是 sh，而 sh 不会转发信号给子进程。改成 exec 形式 <code>ENTRYPOINT ["/app/server"]</code>，业务进程直接成为 PID 1 就能收到 SIGTERM。另一条注意事项来自上一节：PID 1 不执行默认信号处理，所以进程自己也必须显式处理 SIGTERM。</>}
+/>
+
+<Quiz
+  id="docker-3"
+  question="登上一台生产 K8s 节点排障，敲 docker ps 提示 command not found。最合理的下一步是？"
+  options={[
+    {
+      text: '用 crictl ps 看 K8s 容器；需要 docker 那套操作时用 nerdctl，并带上 --namespace k8s.io',
+      correct: true,
+    },
+    { text: '在节点上装一个 Docker，恢复熟悉的命令', feedback: '装了 dockerd 也看不到 Pod 容器 —— 它有自己独立的存储与 namespace，与 kubelet 用的那条链路无关，反而多一个守护进程要维护。' },
+    { text: '说明这台节点的容器运行时坏了，重启 containerd', feedback: '没有 docker 命令是生产节点的正常状态，1.24 之后节点上本来就只装 containerd。' },
+    { text: '用 ctr containers ls 查看', feedback: 'ctr 默认看 default namespace，K8s 的容器在 k8s.io 下，直接敲通常什么都不显示；而且它的输出不带 Pod 语义。' },
+  ]}
+  explain={<>K8s 1.24 移除 dockershim 之后，节点上只需要 containerd，没有 dockerd 也就没有 <code>docker</code> 命令 —— 这是正常状态，不是故障。节点侧排障的主力是 <code>crictl</code>（按 CRI 语义，输出与 kubectl 对得上）；想要 docker 的手感就用 <code>nerdctl</code>，但必须显式指定 <code>--namespace k8s.io</code>，否则看到的是空的 default namespace。</>}
+/>
+
+## 这一节留下的三条习惯
+
+1. **exec 形式写 ENTRYPOINT** —— 一行改动，换掉一整类优雅终止问题
+2. **多阶段构建 + 非 root 用户** —— 镜像既小又能过 K8s 的安全策略
+3. **排障顺序固定：logs → inspect → exec** —— 这个顺序到了 K8s 一模一样，只是命令换成 kubectl

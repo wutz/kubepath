@@ -7,11 +7,11 @@ export const Route = createRootRoute({
     meta: [
       { charSet: 'utf-8' },
       { name: 'viewport', content: 'width=device-width, initial-scale=1, viewport-fit=cover' },
-      { title: 'Kubepath — K8s 工程师成长路径' },
+      { title: 'Kubepath — K8s 成长路线' },
       {
         name: 'description',
         content:
-          'Kubernetes 的在线交互式学习项目：按解决方案架构师、集群运维、存储运维三条岗位路线组织，覆盖容器底座、控制面原理、kubespray 部署运维、网络与存储接入、GPU 与 AI 负载调度。',
+          'Kubernetes 工程师的成长路线：从跑起一个容器，到扛住一套 GPU 集群。按 Docker 容器与镜像、kind 上的对象与调度、生产部署与组件选型、配套组件与日常运维、GPU 与 AI 负载五个阶段循序渐进，配交互式检查点与命令行闯关。',
       },
     ],
     links: [
@@ -43,7 +43,7 @@ function RootLayout() {
               <img src="/logo.svg" alt="" width={26} height={26} className="h-6.5 w-6.5 shrink-0" />
               <span className="text-[15px] font-semibold tracking-[-0.02em]">Kubepath</span>
               <span className="border-line text-mute hidden border-l pl-2.5 text-xs sm:inline">
-                K8s 工程师成长路径
+                K8s 成长路线
               </span>
             </Link>
             <nav className="-mr-1 flex items-center gap-0.5 overflow-x-auto text-sm [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
@@ -82,8 +82,9 @@ function RootLayout() {
           <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
             <div className="eyebrow">Kubepath</div>
             <p className="text-body mt-3 max-w-3xl text-sm leading-relaxed">
-              K8s 工程师成长路径，按岗位分成方案、集群运维、存储运维三条路线。内容基于
-              k8s-in-action 部署手册与 Kubernetes 官方文档整理。
+              K8s 成长路线：容器与镜像 → kind 上的对象与调度 → 生产部署与组件选型 →
+              配套组件与日常运维 → GPU 与 AI 负载。内容基于 k8s-in-action 部署手册与
+              Kubernetes 官方文档整理。
             </p>
             <p className="text-mute mt-2 text-xs">学习进度保存在本地浏览器，换设备不同步。</p>
           </div>

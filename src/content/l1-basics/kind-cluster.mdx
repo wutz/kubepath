@@ -1,0 +1,322 @@
+上一阶段讲的都是单机上的容器。从这一节开始要有一套真的集群 —— 而且是随手能起、随手能删、搞坏了不心疼的那种。
+
+[kind](https://kind.sigs.k8s.io/)（Kubernetes IN Docker）正好干这个：**它把 K8s 节点做成宿主机上的一个个容器**，每个容器里跑 containerd 和 kubelet。五分钟起一个三节点集群，占几百 MB 内存，笔记本就能跑。
+
+后面 L1 每一节的命令 —— 看对象、试调度、抓网络、配 RBAC —— 都在这套集群上跑得动。
+
+## 装 kind 与第一个集群
+
+```bash
+# macOS
+brew install kind kubectl
+
+# Linux
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+
+kind version
+```
+
+前提是本机有 Docker（或 Podman、Colima 之类的兼容运行时）—— 上一阶段练的那套手感直接用得上。
+
+单节点集群一条命令就够，但学调度、学节点故障需要多节点，所以直接写配置：
+
+```yaml
+# kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kubepath
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:            # 把容器里的端口捅到本机，浏览器才访问得到
+      - containerPort: 80
+        hostPort: 8080
+        protocol: TCP
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-a
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-b
+```
+
+```bash
+kind create cluster --config kind-config.yaml
+kubectl cluster-info --context kind-kubepath
+```
+
+两个 worker 打上了不同的 `zone` 标签，是为了后面《调度器》那节能真的验证 `topologySpreadConstraints` —— 单节点集群里那些约束写了等于没写。
+
+<Callout type="tip" title="extraPortMappings 必须在建集群时就写好">
+kind 的端口映射是**创建时**落到那个节点容器上的，事后加不了。想改就得删掉集群重建：
+
+```bash
+kind delete cluster --name kubepath
+kind create cluster --config kind-config.yaml
+```
+
+好在重建只要一分钟 —— 这正是 kind 的价值：集群是**一次性**的，坏了就重来，不用心疼。
+</Callout>
+
+## 节点就是容器：把两个视角对起来
+
+这是 kind 最值得停下来看一眼的地方：
+
+```bash
+kubectl get nodes -o wide
+docker ps --filter name=kubepath
+```
+
+`kubectl` 看到的三个「节点」，在 `docker ps` 里就是三个容器。进去看看：
+
+```bash
+docker exec -it kubepath-worker bash
+
+# 容器里跑着 kubelet 和 containerd —— 和生产节点上一模一样的两个进程
+systemctl status kubelet --no-pager | head -5
+crictl ps | head
+```
+
+上一阶段讲的 `crictl`、pause 容器、镜像分层，在这里全都成立。区别只在于：这个「节点」自己也是一个容器，套了一层。
+
+<Callout type="note" title="套娃是怎么成立的">
+kind 的节点镜像里带了 containerd，容器内再跑容器靠的是特权容器 + 挂载宿主机的 cgroup 层级。
+
+所以 kind 集群里所有 Pod 的进程，**最终都是宿主机上的普通进程** —— 在宿主机 `ps aux | grep nginx` 一样找得到。namespace 套了两层，cgroup 也套了两层，但内核只有一个。
+</Callout>
+
+## 本地镜像怎么进集群
+
+这是新手在 kind 上最容易卡住的一步：本地 `docker build` 出来的镜像，Pod 起来却是 `ErrImagePull`。
+
+原因是**节点容器里的 containerd 和宿主机的 Docker 是两套独立的镜像存储**。宿主机上有，不代表节点上有。
+
+```bash
+docker build -t demo-api:v1 .
+
+# 把镜像塞进所有节点的 containerd
+kind load docker-image demo-api:v1 --name kubepath
+
+# 确认进去了
+docker exec kubepath-worker crictl images | grep demo-api
+```
+
+配套地，Deployment 里要写 `imagePullPolicy: IfNotPresent` —— 默认策略下 `:latest` 标签会强制去 registry 拉，本地有也不用。
+
+<Callout type="trap" title="ErrImagePull 的三种成因，在 kind 上先排第二种">
+1. **registry 拉不通** —— 网络或凭据问题，生产上最常见
+2. **镜像只在宿主机上，没 load 进节点** —— kind 特有，忘了 `kind load` 就会这样
+3. **tag 打错或 imagePullPolicy: Always** —— 本地明明有，策略强制去远端拉
+
+排查一律先看 `kubectl describe pod` 的 Events，那里会写清楚是「拉取失败」还是「找不到镜像」。
+</Callout>
+
+## 跑通第一个对外服务
+
+集群里的 Service 默认只有集群内能访问。要在浏览器里打开，需要一个 Ingress controller 接住 `hostPort: 8080`：
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout=90s
+```
+
+这份 manifest 是 ingress-nginx 官方给 kind 准备的版本 —— 它会把 controller 调度到带 `ingress-ready=true` 标签的那个节点上，正好是配置里写了端口映射的控制面节点。
+
+```yaml
+# demo.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: demo }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: demo } }
+  template:
+    metadata: { labels: { app: demo } }
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          ports: [{ containerPort: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: demo }
+spec:
+  selector: { app: demo }
+  ports: [{ port: 80, targetPort: 80 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: demo }
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: demo, port: { number: 80 } } }
+```
+
+```bash
+kubectl apply -f demo.yaml
+curl -s localhost:8080 | head -5
+```
+
+浏览器打开 `localhost:8080` 能看到 nginx 首页，这条链路就通了：**宿主机 8080 → 节点容器 80 → ingress-nginx → Service → Pod**。这四跳后面《K8s 网络模型》那节会逐段拆开。
+
+## 上机演练
+
+<Terminal
+  id="kind-cluster-flow"
+  host="wutz@macbook"
+  intro={`模拟终端：从零起一套 kind 集群，把本地镜像跑起来。
+输入 goals 看目标，hint 要提示。`}
+  commands={[
+    {
+      cmd: 'kind create cluster --config kind-config.yaml',
+      goal: '起一套 1 控制面 + 2 工作节点的集群',
+      hint: '第一次跑要拉节点镜像，会慢一点。',
+      output: `Creating cluster "kubepath" ...
+ ✓ Ensuring node image (kindest/node:v1.32.0) 🖼
+ ✓ Preparing nodes 📦 📦 📦
+ ✓ Writing configuration 📜
+ ✓ Starting control-plane 🕹️
+ ✓ Installing CNI 🔌
+ ✓ Installing StorageClass 💾
+ ✓ Joining worker nodes 🚜
+Set kubectl context to "kind-kubepath"`,
+    },
+    {
+      cmd: 'kubectl get nodes -o wide',
+      goal: '确认三个节点都 Ready',
+      hint: 'CONTAINER-RUNTIME 那一列值得看一眼。',
+      output: `NAME                     STATUS   ROLES           AGE   VERSION   INTERNAL-IP   CONTAINER-RUNTIME
+kubepath-control-plane   Ready    control-plane   68s   v1.32.0   172.18.0.4    containerd://2.0.2
+kubepath-worker          Ready    <none>          52s   v1.32.0   172.18.0.2    containerd://2.0.2
+kubepath-worker2         Ready    <none>          52s   v1.32.0   172.18.0.3    containerd://2.0.2`,
+    },
+    {
+      cmd: 'docker ps --filter name=kubepath --format "table {{.Names}}\\t{{.Image}}\\t{{.Status}}"',
+      goal: '看清「节点」的真身',
+      hint: '和上一条的三个节点名对照着看。',
+      output: `NAMES                    IMAGE                  STATUS
+kubepath-control-plane   kindest/node:v1.32.0   Up 2 minutes
+kubepath-worker          kindest/node:v1.32.0   Up 2 minutes
+kubepath-worker2         kindest/node:v1.32.0   Up 2 minutes`,
+    },
+    {
+      cmd: 'kubectl get pods -n kube-system',
+      goal: '看看这套集群里都跑了什么',
+      hint: '控制面组件都是静态 Pod，下一节《控制面解剖》会逐个拆。',
+      output: `NAME                                             READY   STATUS    RESTARTS   AGE
+coredns-668d6bf9bc-4x8vq                         1/1     Running   0          2m
+etcd-kubepath-control-plane                      1/1     Running   0          2m
+kindnet-9nv2k                                    1/1     Running   0          2m
+kube-apiserver-kubepath-control-plane            1/1     Running   0          2m
+kube-controller-manager-kubepath-control-plane   1/1     Running   0          2m
+kube-proxy-hs4tp                                 1/1     Running   0          2m
+kube-scheduler-kubepath-control-plane            1/1     Running   0          2m`,
+    },
+    {
+      cmd: 'kubectl run demo --image=demo-api:v1 && kubectl get pod demo',
+      goal: '直接用本地镜像起一个 Pod —— 这里会失败',
+      hint: '宿主机上有这个镜像，节点上未必有。',
+      output: `pod/demo created
+NAME   READY   STATUS         RESTARTS   AGE
+demo   0/1     ErrImagePull   0          8s`,
+    },
+    {
+      cmd: 'kubectl describe pod demo | tail -4',
+      goal: '看 Events 确认失败原因',
+      hint: '排障顺序和 Docker 一样：先看平台怎么说。',
+      output: `Events:
+  Type     Reason     Age   From     Message
+  ----     ------     ----  ----     -------
+  Warning  Failed     12s   kubelet  Failed to pull image "demo-api:v1": failed to resolve reference "docker.io/library/demo-api:v1": pull access denied`,
+    },
+    {
+      cmd: 'kind load docker-image demo-api:v1 --name kubepath',
+      goal: '把镜像送进所有节点的 containerd',
+      hint: '这一步没有 registry 参与，是直接往节点容器里塞。',
+      output: `Image: "demo-api:v1" with ID "sha256:8f2a91c4d3e7" not yet present on node "kubepath-worker2", loading...
+Image: "demo-api:v1" with ID "sha256:8f2a91c4d3e7" not yet present on node "kubepath-worker", loading...
+Image: "demo-api:v1" with ID "sha256:8f2a91c4d3e7" not yet present on node "kubepath-control-plane", loading...`,
+    },
+    {
+      cmd: 'kubectl delete pod demo && kubectl run demo --image=demo-api:v1 --image-pull-policy=IfNotPresent && sleep 5 && kubectl get pod demo',
+      goal: '重建 Pod，这次应该起得来',
+      hint: 'imagePullPolicy 必须是 IfNotPresent，否则还是会去远端拉。',
+      output: `pod "demo" deleted
+pod/demo created
+NAME   READY   STATUS    RESTARTS   AGE
+demo   1/1     Running   0          5s`,
+    },
+  ]}
+/>
+
+## kind 与生产集群的差异清单
+
+这一节的结论要能带走，就得先知道哪些**不能**带走：
+
+| 维度 | kind | 生产集群 | 影响 |
+| --- | --- | --- | --- |
+| 节点 | 同一台机器上的容器 | 独立物理机 / 虚机 | 网络延迟、故障域、NUMA 全都不真实 |
+| CNI | kindnet（最简实现） | Cilium / Calico | NetworkPolicy、eBPF、带宽限制在 kind 上验不了 |
+| 存储 | local-path（本地目录） | Ceph / GPFS / 云盘 | 跨节点挂载、快照、扩容都试不出来 |
+| 负载均衡 | 无，靠 hostPort 映射 | MetalLB / 云 LB | `type: LoadBalancer` 会一直 Pending |
+| 控制面 | 单节点居多 | 3 / 5 节点高可用 | 选主、证书轮转、etcd 仲裁体验不到 |
+| etcd | 和其它组件挤同一块盘 | 独占 NVMe | 性能特征完全不同 |
+
+<Callout type="warn" title="能在 kind 上验证的，和不能的">
+**能验证的**：对象语义、控制器行为、调度约束、探针与生命周期、RBAC、YAML 写得对不对 —— 也就是 L1 这一整个阶段。
+
+**不能验证的**：性能、高可用、真实网络策略、存储后端行为、节点故障恢复。这些要等到 L2 把集群装到真机上。
+
+在 kind 上得出「性能没问题」或者「故障切换没问题」的结论，是最典型的误用。
+</Callout>
+
+<Quiz
+  id="kind-1"
+  question="本地 docker build 出 app:v1，kubectl run 之后 Pod 报 ErrImagePull。最直接的原因是？"
+  options={[
+    {
+      text: '镜像只存在宿主机的 Docker 里，kind 节点容器内的 containerd 没有这份镜像',
+      correct: true,
+    },
+    { text: 'kind 集群没配镜像仓库凭据', feedback: '这是私有 registry 的场景。本地构建的镜像根本没推到任何 registry，凭据帮不上忙。' },
+    { text: 'Docker 和 containerd 的镜像格式不兼容', feedback: '两者都遵循 OCI 标准，格式是通用的 —— 问题是这份镜像没被送到节点上。' },
+    { text: '节点资源不足，kubelet 拒绝拉取', feedback: '资源不足的表现是 Pod Pending 或被驱逐，不是拉取镜像失败。' },
+  ]}
+  explain={<>kind 的每个节点都是一个独立的容器，里面有自己的 containerd 镜像存储，和宿主机的 Docker 完全隔离。解决办法是 <code>kind load docker-image app:v1</code> 把镜像直接塞进节点，同时把 <code>imagePullPolicy</code> 设成 <code>IfNotPresent</code>，否则 kubelet 仍会尝试去 registry 拉取。</>}
+/>
+
+<Quiz
+  id="kind-2"
+  question="在 kind 上跑通了一套带 NetworkPolicy 的多租户方案，准备直接搬到生产。最大的风险是？"
+  options={[
+    {
+      text: 'kindnet 不实现 NetworkPolicy，策略在 kind 上根本没生效，「跑通」是假象',
+      correct: true,
+    },
+    { text: 'kind 的 K8s 版本比生产低，API 可能不兼容', feedback: '版本可以用 --image 指定成和生产一致，这是能控制的变量。' },
+    { text: 'kind 的 Pod CIDR 和生产不同', feedback: 'CIDR 不同只影响具体 IP，不影响策略语义。' },
+    { text: 'kind 不支持 Namespace', feedback: 'Namespace 是核心对象，kind 完全支持。' },
+  ]}
+  explain={<>kind 默认的 CNI 是 kindnet，它只做最基本的 Pod 网络连通，<strong>不实现 NetworkPolicy</strong>。策略对象能创建、能 <code>kubectl get</code> 出来，但没有任何组件去执行它 —— 于是「测试通过」意味着「什么都没拦住」。这类验证必须在装了 Cilium 或 Calico 的集群上做，也就是 L2 的内容。</>}
+/>
+
+## 这一节留下的三个习惯
+
+1. **集群是一次性的** —— 配置写进 `kind-config.yaml`，坏了就 `delete` 再 `create`，别在里面修修补补
+2. **本地镜像要 load** —— `kind load docker-image` + `imagePullPolicy: IfNotPresent`，这两步是一对
+3. **先问「这个结论 kind 验得了吗」** —— 语义类的验得了，性能与高可用类的验不了
