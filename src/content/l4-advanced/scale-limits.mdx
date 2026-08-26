@@ -37,7 +37,7 @@
   │   ├─ 带 resourceVersion=0 → 从 apiserver 的 watch cache 返回（便宜）
   │   └─ 不带或要求强一致    → 【穿透到 etcd】（贵）
   │
-  └─ 写请求 → etcd（必须 fsync，见 L0《etcd 磁盘验收》）
+  └─ 写请求 → etcd（必须 fsync，见 L2《节点 OS 基线》）
 ```
 
 关键是那个分叉：**同样一条 list 请求，走缓存和穿透 etcd 的开销差几个数量级**。

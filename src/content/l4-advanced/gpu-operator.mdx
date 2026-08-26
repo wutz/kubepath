@@ -95,7 +95,7 @@ kubectl run gpu-test --rm -it --restart=Never \
 kubectl exec -it <gpu-pod> -- nvidia-smi topo -m
 ```
 
-第 4 步对应 L0《硬件与拓扑》讲的内容：确认 GPU 之间是 `NV#`（NVLink）而不是 `SYS`（跨 NUMA 走 CPU 互联），以及 GPU 与 RDMA 网卡在同一 NUMA。
+第 4 步对应 L2《硬件与拓扑》讲的内容：确认 GPU 之间是 `NV#`（NVLink）而不是 `SYS`（跨 NUMA 走 CPU 互联），以及 GPU 与 RDMA 网卡在同一 NUMA。
 
 ## 资源申请的规矩
 
@@ -165,7 +165,7 @@ dmesg -T | grep -i nvidia
 ```
 
 <Callout type="tip" title="GPU 节点必须禁止内核自动升级">
-L0《节点 OS 基线》里提过这一项，在 GPU 节点上它是硬要求。
+L2《节点 OS 基线》里提过这一项，在 GPU 节点上它是硬要求。
 
 宿主机装的驱动是针对特定内核版本编译的。内核自动升级之后驱动模块加载失败 —— 节点重启后 `nvidia-smi` 直接不可用，所有 GPU Pod 起不来。
 
@@ -184,7 +184,7 @@ L0《节点 OS 基线》里提过这一项，在 GPU 节点上它是硬要求。
 #    验证 RDMA 网络、拓扑绑定、fabric manager
 ```
 
-对照 L0《硬件与拓扑》里的判断：**实测带宽只有理论值一半，通常是跨 NUMA 或 RoCE 无损网络没配对**。
+对照 L2《硬件与拓扑》里的判断：**实测带宽只有理论值一半，通常是跨 NUMA 或 RoCE 无损网络没配对**。
 
 <Quiz
   id="gpu-1"

@@ -166,7 +166,7 @@ topologySpreadConstraints:
 | `DoNotSchedule` | 摊不开就 Pending —— 真高可用，但可能调度失败 |
 | `ScheduleAnyway` | 尽量摊开，摊不开也放 —— 不保证，但不会卡住 |
 
-前提是节点上有 `topology.kubernetes.io/zone` 标签（L0 的《硬件与拓扑》讲了为什么装机时就要打）。**没打标签的话这个约束等于没配。**
+前提是节点上有 `topology.kubernetes.io/zone` 标签（L2 的《硬件与拓扑》讲了为什么装机时就要打）。**没打标签的话这个约束等于没配。**
 
 ## 优先级、抢占与 PDB
 

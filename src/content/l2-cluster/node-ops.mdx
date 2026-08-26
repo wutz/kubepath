@@ -160,7 +160,7 @@ kubectl run probe --image=busybox --overrides='{"spec":{"nodeName":"cn-192-168-3
 ```
 
 <Callout type="warn" title="新节点最容易漏的是标签">
-L0《硬件与拓扑》讲过：`topologySpreadConstraints` 依赖 `topology.kubernetes.io/zone` 标签。
+本阶段《硬件与拓扑》讲过：`topologySpreadConstraints` 依赖 `topology.kubernetes.io/zone` 标签。
 
 新节点忘了打机架标签，它就不参与拓扑分布计算 —— 结果是副本可能全被摊到这台「无标签」节点上，或者反过来永远调不上去（`DoNotSchedule` 时）。
 

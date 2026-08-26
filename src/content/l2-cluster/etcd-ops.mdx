@@ -52,7 +52,7 @@ ETCDCTL_API=3 etcdctl \
 <Callout type="tip" title="RAFT TERM 持续增长是磁盘问题的信号">
 `etcd_server_leader_changes_seen_total` 这个指标（以及 RAFT TERM 的数值）在涨，说明集群在反复选主。
 
-原因几乎总是这两个：**磁盘 fsync 太慢**（心跳超时）或**网络抖动**。而 L0 讲过，磁盘是更常见的那个。
+原因几乎总是这两个：**磁盘 fsync 太慢**（心跳超时）或**网络抖动**。而《节点 OS 基线》讲过，磁盘是更常见的那个。
 
 所以看到 term 在涨，第一件事是查 `etcd_disk_wal_fsync_duration_seconds` 的 p99，而不是去调 Raft 的超时参数 —— 调参数只是把症状盖住。
 </Callout>

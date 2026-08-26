@@ -16,7 +16,7 @@
 
 三条硬性要求：
 
-1. **etcd 独占一块本地 NVMe** —— 不与系统盘共享，不用任何网络存储（见《etcd 磁盘验收》）
+1. **etcd 独占一块本地 NVMe** —— 不与系统盘共享，不用任何网络存储（验收方法见《节点 OS 基线》）
 2. **内存要给 apiserver 留足** —— apiserver 会缓存集群里所有对象，大集群里它是内存消耗的主体
 3. **控制面节点不要跑业务** —— 默认的 `node-role.kubernetes.io/control-plane:NoSchedule` 污点别去掉
 

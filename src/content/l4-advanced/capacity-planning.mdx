@@ -60,7 +60,7 @@ kubectl get node <node> -o jsonpath='{.status.allocatable}'
 这四条里，后两条是**规划失误才会撞上的**，而它们恰恰是最难改的：`maxPods` 要重启 kubelet，节点子网掩码改不了。
 
 <Callout type="trap" title="最常见的规划失误：网段先于资源用完">
-L0 的《集群规划》里算过一个例子：Pod CIDR `/16` 配每节点 `/26`，每节点只有 62 个可用 IP。
+L2 的《集群规划》里算过一个例子：Pod CIDR `/16` 配每节点 `/26`，每节点只有 62 个可用 IP。
 
 而 kubelet 的 `maxPods` 默认是 110。这时候真正的密度上限是 **62**，不是 110 —— 你按 110 做的容量规划，从第一天起就有 44% 的账是假的。
 

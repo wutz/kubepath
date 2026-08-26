@@ -50,6 +50,11 @@ export const roles: Role[] = [
     ],
     stages: [
       {
+        title: '先有共同语言',
+        hint: '方案里天天写「容器」「镜像」，先知道它们在机器上到底是什么',
+        lessons: ['l0-foundation/container-runtime', 'l0-foundation/docker-basics'],
+      },
+      {
         title: '对象与语义',
         hint: '方案里每写一个词，都得知道它落到集群上是什么东西',
         lessons: [
@@ -61,11 +66,11 @@ export const roles: Role[] = [
       },
       {
         title: '把需求写成集群规格',
-        hint: '这条线的主课，计算器在这一段',
+        hint: '这条线的主课：先定机型，再写规划，最后把数字算出来',
         lessons: [
-          'l0-foundation/hardware-topology',
-          'l0-foundation/cluster-plan',
-          'l0-foundation/os-tuning',
+          'l2-cluster/hardware-topology',
+          'l2-cluster/cluster-plan',
+          'l2-cluster/os-tuning',
           'l4-advanced/capacity-planning',
         ],
       },
@@ -75,9 +80,9 @@ export const roles: Role[] = [
         lessons: [
           'l3-platform/cni-cilium',
           'l3-platform/k8s-storage',
-          'l3-platform/observability',
           'l4-advanced/gpu-operator',
           'l4-advanced/ai-scheduling',
+          'l3-platform/observability',
         ],
       },
       {
@@ -92,7 +97,7 @@ export const roles: Role[] = [
     title: '集群运维工程师',
     alias: 'K8s 平台 · GPU 集群 · 完整主线',
     tagline: '集群是你的产品，L0 到 L4 一节不落',
-    desc: '本站不做裁剪的那条主线：先把容器与节点底座打牢，吃透控制面与调度，再用 kubespray 把集群装出来扛住升级与故障，最后接上网络、存储、观测，走进 GPU 与 AI 负载的战场。',
+    desc: '本站不做裁剪的那条主线：先把容器与镜像这层底座打牢，吃透控制面与调度，再从机型、规划、节点基线一路走到 kubespray 装机与升级故障，最后接上网络、存储、观测，走进 GPU 与 AI 负载的战场。',
     outcomes: [
       '独立部署并运维生产级集群，扛住节点失联、控制面扩缩与版本升级',
       '把网络、存储、监控、镜像仓库接成一个能交付给业务的平台',
@@ -125,13 +130,14 @@ export const roles: Role[] = [
           'l0-foundation/container-runtime',
           'l0-foundation/docker-basics',
           'l0-foundation/containerd-cri',
-          'l0-foundation/os-tuning',
+          'l2-cluster/os-tuning',
         ],
       },
       {
         title: '够用的 K8s 心智模型',
-        hint: '不必会部署集群，但要知道一个对象是怎么变成节点上的挂载点的',
+        hint: '不必会部署集群，但要先会查，再知道一个对象是怎么变成节点上的挂载点的',
         lessons: [
+          'l2-cluster/kubectl-toolbox',
           'l1-core/architecture',
           'l1-core/declarative',
           'l1-core/api-objects',
@@ -142,7 +148,6 @@ export const roles: Role[] = [
         title: '把后端存储接进集群',
         hint: '这条线的主课：从 PVC 语义到 CSI 落地，再到卡住时怎么查',
         lessons: [
-          'l2-cluster/kubectl-toolbox',
           'l3-platform/k8s-storage',
           'l3-platform/csi-practice',
           'l3-platform/quest-pvc-pending',

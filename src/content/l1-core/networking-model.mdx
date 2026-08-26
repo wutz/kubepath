@@ -242,7 +242,7 @@ Service 有 ClusterIP、DNS 也能解析，就是连不上 —— 先看 endpoin
     { text: 'Service 的 selector 写错了', feedback: 'selector 错会导致 endpoints 为空，所有访问一律失败，不会时通时不通。' },
     { text: 'ClusterIP 不能 ping', feedback: 'ping 不通是正常现象，与实际端口能否访问无关。' },
   ]}
-  explain={<>「结果取决于目标 Pod 在不在同一节点」是一个非常特征化的信号：同节点内的流量走网桥，跨节点的走路由。<code>br_netfilter</code> 决定桥接流量是否经过 iptables —— 没有它，同节点的包绕过了 kube-proxy 的 DNAT，ClusterIP 解析不到后端；而跨节点的包走路由，不受影响。这就是 L0《节点 OS 基线》要把这个模块列进检查清单的原因。</>}
+  explain={<>「结果取决于目标 Pod 在不在同一节点」是一个非常特征化的信号：同节点内的流量走网桥，跨节点的走路由。<code>br_netfilter</code> 决定桥接流量是否经过 iptables —— 没有它，同节点的包绕过了 kube-proxy 的 DNAT，ClusterIP 解析不到后端；而跨节点的包走路由，不受影响。这就是 L2《节点 OS 基线》要把这个模块列进检查清单的原因。</>}
 />
 
 <Quiz
