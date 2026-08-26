@@ -122,7 +122,7 @@ spec:
           persistentVolumeClaim: { claimName: model-repo }   # RWX，多副本共享
 ```
 
-注意模型仓库必须是 **RWX** 卷（CephFS / GPFS，见 L3《存储接入》）—— 多个副本要同时读同一份权重。
+注意模型仓库必须是 **RWX** 卷（CephFS / GPFS，见 L2《存储接入》）—— 多个副本要同时读同一份权重。
 
 ### 单机多卡：张量并行
 

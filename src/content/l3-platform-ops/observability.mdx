@@ -106,7 +106,7 @@ helmwave up --build
 kubectl apply -k prometheus
 ```
 
-访问 `https://gf.k8s1.zw1.paratera.com`（前面配的域名，走 L3《服务暴露》那一套 Ingress + cert-manager）。
+访问 `https://gf.k8s1.zw1.paratera.com`（前面配的域名，走 L2《服务暴露》那一套 Ingress + cert-manager）。
 
 <Callout type="note" title="为什么用 VictoriaMetrics 而不是 Prometheus">
 两者的查询语言和生态兼容（PromQL、ServiceMonitor、Grafana 面板都能直接用），差别在资源开销和运维模型：

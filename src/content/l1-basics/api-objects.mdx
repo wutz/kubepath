@@ -180,7 +180,7 @@ spec:
 <Callout type="warn" title="ttlSecondsAfterFinished 不配，etcd 会被慢慢填满">
 Job 完成后默认**不会自己消失**，Pod 对象也留着。每天几百个 CronJob 实例，跑一年就是十几万个对象堆在 etcd 里。
 
-后果是 etcd 数据库膨胀触发 `mvcc: database space exceeded`，然后整个集群拒绝写入。L2 的《etcd 运维》讲怎么救，但更省事的是一开始就配上 `ttlSecondsAfterFinished` 和 `successfulJobsHistoryLimit`。
+后果是 etcd 数据库膨胀触发 `mvcc: database space exceeded`，然后整个集群拒绝写入。L3 的《etcd 运维》讲怎么救，但更省事的是一开始就配上 `ttlSecondsAfterFinished` 和 `successfulJobsHistoryLimit`。
 </Callout>
 
 ## ConfigMap 与 Secret 的热更新边界

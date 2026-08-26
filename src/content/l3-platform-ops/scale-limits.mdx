@@ -16,7 +16,7 @@
 <Callout type="note" title="真正先撞上的往往不是节点数">
 这张表容易让人误判「我才 200 台，离 5000 还远」。实际先出问题的通常是：
 
-- **对象总数** —— Event、Job、Secret 堆积（见 L2《etcd 运维》）
+- **对象总数** —— Event、Job、Secret 堆积（见 L3《etcd 运维》）
 - **list/watch 压力** —— 某个组件在疯狂拉全量数据
 - **Service 与 endpoints 数量** —— 影响 kube-proxy 规则同步
 - **etcd 数据库大小** —— 撞上配额直接全集群不可写
@@ -218,7 +218,7 @@ kubectl get --raw /metrics | grep kubeproxy_sync_proxy_rules_duration_seconds
 | **合规要求物理隔离** | 不同网络域、不同数据等级 |
 
 <Callout type="warn" title="拆集群会把一类问题换成另一类">
-拆完之后，单集群的规模问题没了，但你得到了 L4《多租户》里讲过的那套成本：**升级 ×N、监控 ×N、备份与恢复演练 ×N、配置逐渐漂移**。
+拆完之后，单集群的规模问题没了，但你得到了 L3《多租户》里讲过的那套成本：**升级 ×N、监控 ×N、备份与恢复演练 ×N、配置逐渐漂移**。
 
 而且跨集群的问题是新的：服务如何跨集群发现、流量如何调度、镜像和配置如何一致分发。
 

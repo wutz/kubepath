@@ -1,0 +1,151 @@
+kubespray 跑完，`kubectl get nodes` 全是 Ready —— 但这套集群还交付不了业务。它现在只有一个能调度 Pod 的内核，外面那一圈得自己选、自己接。
+
+这一节不装任何东西，只做一件事：**把六层组件的候选项、判断依据和代价摆在一张表上**，先想清楚再动手。后面几节是这些选择的落地。
+
+## 六层版图
+
+| 层 | 解决什么 | 不选会怎样 |
+| --- | --- | --- |
+| **CNI** | Pod 之间怎么通信 | 集群装不完，节点一直 NotReady |
+| **CSI** | 数据往哪写 | 只能跑无状态服务，Pod 一挂数据就没 |
+| **LB** | 集群外怎么进来（四层） | `type: LoadBalancer` 永远 Pending |
+| **入口网关** | HTTP 路由、TLS、灰度（七层） | 每个服务自己开 NodePort，端口表迅速失控 |
+| **镜像仓库** | 镜像从哪拉 | 依赖公网，节点多了就是流量灾难 |
+| **可观测性** | 出事了看什么 | 排障只能靠 `kubectl logs` 一个个翻 |
+
+前四层要在交付前定，后两层可以晚一步接（L3 的内容），但都别拖过第一个业务上线。
+
+## CNI：先定这一个
+
+CNI 是所有选择里最先做、也最难改的 —— 换 CNI 基本等于集群重装。
+
+| 候选 | 适合 | 代价 |
+| --- | --- | --- |
+| **Cilium** | 生产默认。eBPF 数据面、无 kube-proxy 模式、L7 策略、Hubble 可观测 | 内核要 5.10+，概念多，排障要懂 eBPF |
+| **Calico** | 需要 BGP 直接和物理网络对等、或团队已有 Calico 经验 | iptables 模式在大规模下规则膨胀，eBPF 模式生态不如 Cilium |
+| **Flannel** | 只要通就行的小集群、测试环境 | 不支持 NetworkPolicy，没有可观测能力，后期一定要换 |
+| **kindnet** | 只在 kind 里 | 生产不可用 |
+
+<Callout type="trap" title="Flannel 起步、后面再换，是最贵的一条路">
+「先用 Flannel 跑起来，等有需求再换 Cilium」听起来很务实，实际是把成本推到最坏的时点。
+
+换 CNI 需要：清空所有 Pod（IP 全变）、卸载旧 CNI 的 CRD 与 iptables 规则、逐节点重启 kubelet，中途集群网络是断的。空集群做要十分钟，跑着两百个业务 Pod 时做，那是一次全量停机。
+
+CNI 属于「装机时定，两年不动」的决定。默认选 Cilium，除非有明确理由。
+</Callout>
+
+## CSI：按后端和场景选
+
+| 候选 | 适合 | 代价 |
+| --- | --- | --- |
+| **local-path** | 测试、以及明确接受「Pod 绑死在节点上」的场景 | 节点挂了数据就没了，不能跨节点漂移 |
+| **NFS** | 配置文件、小规模共享读写 | 元数据操作慢，不适合数据库和高并发训练读 |
+| **Ceph RBD / CephFS** | 通用生产存储，块 + 文件都要 | 要独立运维一套 Ceph，性能调优有门槛 |
+| **GPFS / 并行文件系统** | AI 训练：多机多卡同时读同一份数据集 | 商业授权、专用硬件、网络要求高 |
+
+选型的关键问题只有三个：**要不要跨节点漂移**、**读写模式是什么**（RWO / RWX）、**带宽和 IOPS 需要多少**。
+
+<Callout type="warn" title="GPU 训练集群里，存储常常是真正的瓶颈">
+八卡 A100 节点做图像训练，数据管道要喂饱 GPU，单节点读带宽经常需要几个 GB/s。这个数字 NFS 给不了，普通 Ceph 也吃力。
+
+现象很有欺骗性：`nvidia-smi` 看到利用率在 30% 和 100% 之间来回跳 —— 看起来像调度问题或者代码问题，实际是数据读不上来。这一点在 L4《训练与推理平台》会展开。
+</Callout>
+
+## LB 与入口：四层和七层是两件事
+
+这两层经常被混在一起讲，但它们解决的是不同问题：
+
+- **LB（四层）** —— 给 `type: LoadBalancer` 的 Service 分配一个集群外能访问的 IP
+- **入口网关（七层）** —— 按域名和路径把 HTTP 请求分发到不同 Service，管 TLS、重写、灰度
+
+裸金属集群上，K8s **自己不提供**四层 LB（云上由云厂商的 controller 提供），所以要自己装：
+
+| 四层候选 | 适合 | 代价 |
+| --- | --- | --- |
+| **MetalLB** | 裸金属通用方案，L2 模式几分钟接完 | L2 模式下所有流量走单个节点，带宽受限；BGP 模式要网络团队配合 |
+| **kube-vip** | 主要给 apiserver 做 VIP，也能兼做 Service LB | Service LB 能力不如 MetalLB 完整 |
+| **Cilium LB-IPAM** | 已经用 Cilium 时，少装一个组件 | 和 Cilium 版本绑定 |
+
+七层这一层，现在处在 Ingress 向 Gateway API 迁移的中间态：
+
+| 七层候选 | 适合 | 代价 |
+| --- | --- | --- |
+| **Ingress-NGINX** | 存量最大、文档最多、团队最熟 | 配置靠 annotation 堆叠，跨命名空间共享网关的权限模型很弱 |
+| **Gateway API 实现**（Cilium Gateway / Envoy Gateway / NGINX Gateway Fabric） | 新集群优先。角色分离（平台管 Gateway、业务管 HTTPRoute）、原生支持流量切分 | 生态还在补齐，部分注解型能力要重新找对应写法 |
+
+<Callout type="tip" title="Gateway API 不是「Ingress v2」，是权限模型的重构">
+Ingress 把所有配置压在一个对象上，于是平台团队和业务团队只能共用一份 YAML，谁都能改坏谁。
+
+Gateway API 拆成三层角色：基础设施方管 `GatewayClass`，平台团队管 `Gateway`（监听端口、证书），业务团队管 `HTTPRoute`（自己命名空间里的路由）。业务改路由不需要动网关，也改不到别人的路由。
+
+这个差别在单团队小集群上看不出价值，在多团队共享集群上是决定性的 —— 这也是新集群应该直接上 Gateway API 的主要理由。具体配置见下一节《把服务暴露出去》。
+</Callout>
+
+## 两套参考组合
+
+**通用业务集群**（Web 服务、内部系统、CI）
+
+```
+CNI          Cilium（kube-proxy replacement 模式）
+CSI          Ceph RBD（块）+ CephFS（共享读写）
+四层 LB      MetalLB，L2 模式
+七层入口     Cilium Gateway API
+镜像仓库     Harbor + Spegel（节点间 P2P 分发）
+可观测性     kube-prometheus-stack + Loki
+```
+
+**GPU 训练集群**
+
+```
+CNI          Cilium + Multus（业务网与 RDMA 网双网卡）
+CSI          GPFS 或并行文件系统（数据集）+ local-path NVMe（checkpoint 暂存）
+四层 LB      MetalLB（推理服务对外）
+七层入口     Gateway API（多模型多路由）
+镜像仓库     Harbor + Spegel（AI 镜像动辄十几 GB，P2P 分发收益极大）
+可观测性     kube-prometheus-stack + DCGM Exporter（GPU 指标）
+加速器       GPU Operator + Volcano / Kueue
+```
+
+## 选型顺序：哪些决定必须先做
+
+组件之间有依赖，做反了要返工：
+
+```
+1. CNI          ← 最先定，决定 NetworkPolicy 能力与 Gateway 实现的可选面
+2. CSI          ← 决定有状态业务能不能上，GPU 场景决定训练能跑多快
+3. 四层 LB      ← 决定七层网关怎么对外暴露
+4. 七层入口     ← 依赖上面三个
+5. 镜像仓库     ← 可以后接，但节点规模上去之前必须有
+6. 可观测性     ← 可以后接，但第一次故障之前必须有
+```
+
+<Callout type="note" title="「先跑起来，以后再补」的合理边界">
+可以后补的：镜像仓库、可观测性、备份策略、多租户隔离 —— 它们是加法，接上去不影响已有业务。
+
+不能后补的：CNI、CSI 的后端类型、集群网段规划 —— 它们是地基，改动意味着停机迁移。
+
+判断标准很简单：**这个决定改起来要不要动已经在跑的 Pod？** 要动的，就必须在第一个业务上线前定死。
+</Callout>
+
+<Quiz
+  id="stack-1"
+  question="一套裸金属集群装完 Cilium，业务方创建了 type: LoadBalancer 的 Service，EXTERNAL-IP 一直是 Pending。最可能缺什么？"
+  options={[
+    {
+      text: '缺一个四层 LB 实现（MetalLB / Cilium LB-IPAM）来分配外部 IP',
+      correct: true,
+    },
+    { text: 'Cilium 没装好，应该重装 CNI', feedback: 'CNI 负责 Pod 网络，Pod 之间通不通和 EXTERNAL-IP 分配是两回事。Cilium 正常工作时这个 Service 的 ClusterIP 是能通的。' },
+    { text: '缺 Ingress controller', feedback: 'Ingress 是七层，处理的是 HTTP 路由；它自己通常也需要一个 LoadBalancer Service 才能对外暴露。' },
+    { text: 'kube-proxy 没起来', feedback: 'kube-proxy 负责 Service 的集群内转发规则，不负责给 LoadBalancer 类型分配外部 IP。' },
+  ]}
+  explain={<>云上 <code>type: LoadBalancer</code> 由云厂商的 cloud-controller-manager 接管，裸金属没有这个东西 —— K8s 自身<strong>不实现</strong>四层 LB。所以 Service 会一直停在 Pending，等一个能给它分 IP 的控制器。装 MetalLB（或启用 Cilium 的 LB-IPAM）并配好可用 IP 段之后，EXTERNAL-IP 才会落下来。</>}
+/>
+
+## 这一节留下的三个判断
+
+1. **CNI 和存储后端是地基**，装机时定死，别指望以后平滑替换
+2. **四层和七层要分开想** —— LoadBalancer Pending 找 MetalLB，路由不对找网关
+3. **新集群直接上 Gateway API** —— 它解决的是多团队的权限模型，不只是换个 YAML 写法
+
+接下来三节把这些选择落地：《CNI 与 Cilium》装网络，《把服务暴露出去》配 MetalLB 与 Gateway，《PV、PVC 与 CSI》接存储。
