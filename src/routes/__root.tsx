@@ -7,7 +7,7 @@ export const Route = createRootRoute({
     meta: [
       { charSet: 'utf-8' },
       { name: 'viewport', content: 'width=device-width, initial-scale=1, viewport-fit=cover' },
-      { title: 'Kubepath — K8s 工程师成长路径' },
+      { title: 'Kubepath — K8s 成长路线' },
       {
         name: 'description',
         content:
@@ -43,7 +43,7 @@ function RootLayout() {
               <img src="/logo.svg" alt="" width={26} height={26} className="h-6.5 w-6.5 shrink-0" />
               <span className="text-[15px] font-semibold tracking-[-0.02em]">Kubepath</span>
               <span className="border-line text-mute hidden border-l pl-2.5 text-xs sm:inline">
-                K8s 工程师成长路径
+                K8s 成长路线
               </span>
             </Link>
             <nav className="-mr-1 flex items-center gap-0.5 overflow-x-auto text-sm [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
@@ -82,7 +82,7 @@ function RootLayout() {
           <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
             <div className="eyebrow">Kubepath</div>
             <p className="text-body mt-3 max-w-3xl text-sm leading-relaxed">
-              K8s 工程师成长路径：容器与镜像 → kind 上的对象与调度 → 生产部署与组件选型 →
+              K8s 成长路线：容器与镜像 → kind 上的对象与调度 → 生产部署与组件选型 →
               配套组件与日常运维 → GPU 与 AI 负载。内容基于 k8s-in-action 部署手册与
               Kubernetes 官方文档整理。
             </p>
