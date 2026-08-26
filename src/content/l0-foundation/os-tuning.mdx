@@ -1,6 +1,6 @@
 集群装完第一周风平浪静，第三周开始出各种说不清的问题：某个节点偶发 NotReady、容器日志采集器时不时崩、Pod 密度上去之后网络开始丢包。
 
-这类问题的共同点是**不可复现、看起来随机**。而它们的根子往往在装机时没对齐的几个 OS 参数上。这一节是一份上线前的检查清单。
+这类问题的共同点是**不可复现、看起来随机**。而它们的根子往往在装机时没对齐的几个 OS 参数上，或者一块本来就不该给 etcd 用的盘。这一节是一份上线前的检查清单。
 
 ## 为什么必须装机时做
 
@@ -169,6 +169,76 @@ sysctl -a | grep inotify
   explain={<>报错里的 <code>too many open files</code> 有两个可能来源：<code>fs.file-max</code> / <code>nr_open</code>，以及 <code>fs.inotify.max_user_instances</code>。而「采不到<strong>新</strong> Pod 的日志」这个细节指向后者 —— 采集器需要为每个新日志文件申请一个 inotify watch，默认 128 个 instances 在高密度节点上根本不够。这也是 <code>80-inotify.conf</code> 值得单独拎出来配的原因。</>}
 />
 
+## etcd 数据盘验收：唯一一条硬件硬线
+
+OS 参数改错了还能改回来，盘选错了只能停机换。所以基线检查里必须包含这一项。
+
+etcd 用 Raft 保证一致性，而 Raft 有条不能商量的规则：**每次写提案都要 fsync 落盘之后才算确认**。于是一次 `kubectl apply` 的延迟里，实打实包含一次磁盘 fsync：
+
+```
+盘 fsync 慢 → etcd 提案确认慢 → apiserver 写超时
+  → 心跳超不上 → 触发选主 → 选主期间集群不可写
+    → kubelet 上报失败 → 节点开始随机 NotReady
+```
+
+「集群整体发黏」最常见的根因就在这里。
+
+**硬件要求**：NVMe SSD 优先，SATA SSD 可接受；**独占一块盘**，不与系统盘、日志盘共享；机械盘、NAS、SAN、iSCSI、Ceph RBD、NFS 一律禁止。
+
+<Callout type="trap" title="千万不要把 etcd 放在网络存储上">
+搭实验环境时最容易犯的错：集群里已经有一套 Ceph 或 GPFS，很自然就想「数据目录都放共享存储，节点坏了好迁移」。
+
+但网络存储的 fsync 要多跨一次网络往返 —— 延迟从几十微秒变成几毫秒甚至几十毫秒，抖动还大得多。更糟的是形成循环依赖：存储集群出问题会拖垮 K8s 控制面，而存储的 CSI 又跑在这个 K8s 上。
+
+etcd 数据目录必须是**本地盘**，最好独占。它一共就那么几个 GB，不值得为它省一块盘。
+</Callout>
+
+验收方法是让 fio 的行为像 etcd 写 WAL —— 小块、顺序、每写一次就 fdatasync：
+
+```bash
+fio --rw=write --ioengine=sync --fdatasync=1 \
+    --directory=/var/lib/etcd \
+    --size=22m --bs=2300 \
+    --name=etcd-test
+```
+
+`--fdatasync=1` 是核心，去掉就毫无意义；`--bs=2300` 匹配 etcd WAL 条目的典型大小；`--directory` 必须指向 etcd **实际要用的**那个路径。fio 版本需 ≥ 3.5，旧版不报 fdatasync 的百分位。
+
+输出里只看一段：
+
+```
+sync percentiles (usec):
+| 99.00th =[ 807]     ← 0.8ms，NVMe，余量充足
+| 99.00th =[72192]    ← 72ms，机械盘，超标七倍，装上去会一直选主
+```
+
+**判定标准：99.00th < 10000 usec（10ms）。**但 fio 跑的是一台空机器，真实 etcd 还有 boltdb 刷盘、快照、压缩抢同一块盘 —— 测出来在 3000 usec 以内才叫有余量，卡在 9ms 相当于零余量。
+
+上线之后换成三个运行态指标接着盯：
+
+| 指标 | 目标 |
+| --- | --- |
+| `etcd_disk_wal_fsync_duration_seconds` p99 | < 10ms |
+| `etcd_disk_backend_commit_duration_seconds` p99 | < 25ms |
+| `etcd_server_leader_changes_seen_total` | 不增长 |
+
+官方告警阈值（fsync p99 > 500ms 持续 10 分钟）放得比验收线宽得多，**别拿它当验收标准** —— 等它响的时候集群已经很难用了，自己的告警建议设在 50–100ms。
+
+<Quiz
+  id="os-2"
+  question="fio 测出 sync 的 99.00th = 8500 usec。以下判断哪个最合理？"
+  options={[
+    {
+      text: '数值上通过了 10ms 的线，但余量太小，应该换更快的盘',
+      correct: true,
+    },
+    { text: '低于 10ms 就是合格，可以直接上线', feedback: 'fio 是隔离测试，真实 etcd 还有 boltdb 刷盘、快照与压缩的额外 I/O，8.5ms 上线后必然突破。' },
+    { text: '不合格，必须低于 1ms', feedback: '1ms 是好盘的表现，但不是验收线。判定标准是 p99 < 10ms，只是要留足余量。' },
+    { text: '要再看 99.90th 才能判断', feedback: 'p99.9 会被极少数长尾拉高，官方判定只看 99.00th。' },
+  ]}
+  explain={<>验收线是 99.00th &lt; 10000 usec，但 fio 跑的是一台空机器。真实场景里 etcd 还有其它 I/O 竞争同一块盘，所以 8.5ms 相当于零余量。经验做法：测出来在 3000 usec 以内才算放心上线。</>}
+/>
+
 ## 上线前检查清单
 
 装机之后、跑 kubespray 之前，逐项确认：
@@ -184,4 +254,8 @@ sysctl -a | grep inotify
 | 7 | 时间同步正常，时区一致 | `timedatectl timesync-status` |
 | 8 | cgroup v2 已启用 | `stat -fc %T /sys/fs/cgroup` → `cgroup2fs` |
 | 9 | 内核自动升级已禁用（GPU 节点必查） | 看 apt / dnf 的自动升级配置 |
-| 10 | etcd 数据盘已通过 fio 验收 | 见上一节 |
+| 10 | etcd 盘不是机械盘、不是网络存储、独占 | `lsblk -d -o NAME,SIZE,ROTA` + `df -h /var/lib/etcd` |
+| 11 | etcd 盘 fio 验收：99.00th < 10000 usec（< 3000 才有余量） | 见上面的 fio 命令 |
+
+这份清单过完，机器就可以交给 kubespray 了 —— 下一次动这些参数的成本，会比现在高一个量级。
+

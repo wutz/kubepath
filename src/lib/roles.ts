@@ -63,9 +63,9 @@ export const roles: Role[] = [
         title: '把需求写成集群规格',
         hint: '这条线的主课，计算器在这一段',
         lessons: [
-          'l0-foundation/cluster-plan',
           'l0-foundation/hardware-topology',
-          'l0-foundation/etcd-disk',
+          'l0-foundation/cluster-plan',
+          'l0-foundation/os-tuning',
           'l4-advanced/capacity-planning',
         ],
       },
@@ -123,9 +123,9 @@ export const roles: Role[] = [
         hint: '存储最终挂在节点上，先知道那台机器上发生了什么',
         lessons: [
           'l0-foundation/container-runtime',
+          'l0-foundation/docker-basics',
           'l0-foundation/containerd-cri',
           'l0-foundation/os-tuning',
-          'l0-foundation/etcd-disk',
         ],
       },
       {
