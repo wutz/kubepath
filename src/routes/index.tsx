@@ -26,11 +26,12 @@ function Home() {
           {stats.lessonCount} lessons · {stats.trackCount} levels ·{' '}
           {Math.round(stats.totalMinutes / 60)} hours
         </div>
-        <h1 className="display-2xl mt-3">一条主线，从容器走到 AI 平台。</h1>
+        <h1 className="display-2xl mt-3">从跑起一个容器，到扛住一套 GPU 集群。</h1>
         <p className="text-body mt-4 max-w-2xl text-[17px] leading-relaxed">
-          先用 Docker 把容器与镜像吃透，再在本机的 kind 集群上摸熟 K8s 对象与调度，
-          然后把集群装到真机上并逐层选型，接上观测与仓库、扛住升级与故障，
-          最后走进 GPU、训练与推理的战场。{stats.lessonCount} 节课按这个顺序排好，从头走就行。
+          K8s 的难不在命令多，而在每个现象背后都压着好几层：容器、运行时、控制面、网络、存储。
+          这条成长路线按真实的成长顺序排：先用 Docker 把容器与镜像吃透，再在本机的 kind
+          集群上摸熟对象与调度，然后把集群装到真机上并逐层选型，接上观测与仓库、扛过升级与故障，
+          最后走进 GPU、训练与推理。{stats.lessonCount} 节课，一节一节往上走。
         </p>
       </section>
 

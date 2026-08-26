@@ -34,7 +34,7 @@ Harbor 的 proxy cache 让 `docker.io/library/nginx` 这样的地址在第一次
 
 ### 节点层（推荐）
 
-L2《把规划写进配置》讲过：镜像源配在 containerd，业务清单里照常写 `nginx:1.27`。
+L2《用 kubespray 装出第一套集群》讲过：镜像源配在 containerd，业务清单里照常写 `nginx:1.27`。
 
 ```yaml
 # group_vars/all/containerd.yml
@@ -101,7 +101,7 @@ helmwave up --build
 ```
 
 <Callout type="trap" title="Spegel 依赖 containerd_discard_unpacked_layers: false">
-这是个隐蔽的依赖。L2《把规划写进配置》里提到过这个参数：设成 `true` 能省磁盘（丢掉解包后不再需要的原始层）。
+这是个隐蔽的依赖。L2《用 kubespray 装出第一套集群》里提到过这个参数：设成 `true` 能省磁盘（丢掉解包后不再需要的原始层）。
 
 但 Spegel 的工作原理正是**把本节点已有的层分享给其它节点** —— 层被丢掉了就没东西可分享，P2P 静默失效，看起来装了但不起作用。
 

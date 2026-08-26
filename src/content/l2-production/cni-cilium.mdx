@@ -52,7 +52,7 @@ ipam:
     clusterPoolIPv4MaskSize: 24
 ```
 
-这两个值要和 L2《把规划写进配置》里的 `kube_pods_subnet` / `kube_network_node_prefix` **完全对齐**。不一致会出现 Pod 拿到的 IP 与集群路由预期不符。
+这两个值要和 L2《用 kubespray 装出第一套集群》里的 `kube_pods_subnet` / `kube_network_node_prefix` **完全对齐**。不一致会出现 Pod 拿到的 IP 与集群路由预期不符。
 
 ### 3. apiserver 直连地址
 

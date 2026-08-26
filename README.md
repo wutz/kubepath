@@ -1,10 +1,11 @@
 # Kubepath
 
-**K8s 工程师**的在线交互式学习项目。
+**K8s 成长路线** —— 从跑起一个容器，到扛住一套 GPU 集群。
 
-先用 Docker 把容器与镜像吃透，再在本机的 kind 集群上摸熟 K8s 对象与调度，然后把集群装到真机上
-并逐层选型（CNI、CSI、LB、Gateway API），接上可观测性与镜像仓库、扛住升级与故障，
-最后走进 GPU、训练与推理的 AI 战场。
+K8s 的难不在命令多，而在每个现象背后都压着好几层：容器、运行时、控制面、网络、存储。
+这个项目按真实的成长顺序把它拆开：先用 Docker 把容器与镜像吃透，再在本机的 kind 集群上摸熟
+对象与调度，然后把集群装到真机上并逐层选型（CNI、CSI、LB、Gateway API），接上可观测性与
+镜像仓库、扛过升级与故障，最后走进 GPU、训练与推理。
 
 ## 学习主线
 
@@ -12,7 +13,7 @@
 L3 配套组件与日常运维 → L4 AI 场景**。按顺序从头走就行，每一节都建立在前面几节之上。
 
 首页给出整条主线的进度、下一节的入口，以及按阶段展开的全部课程清单。课程页顶部显示
-「第 N / 39 节」，上一课 / 下一课按全局顺序走，跨阶段也连得上；右侧目录是当前阶段的课程列表。
+「第 N / 38 节」，上一课 / 下一课按全局顺序走，跨阶段也连得上；右侧目录是当前阶段的课程列表。
 进度存在浏览器 localStorage，换设备不同步。
 
 ## 课程阶段
@@ -21,11 +22,11 @@ L3 配套组件与日常运维 → L4 AI 场景**。按顺序从头走就行，�
 | --- | --- | --- |
 | **L0** `l0-container` | 容器与镜像 | 围绕 Docker：容器原理（namespace / cgroup / 镜像）、Docker 基础与 Docker–containerd 关系 |
 | **L1** `l1-basics` | K8s 基础与对象 | 围绕 kind：本地多节点集群、控制面解剖、声明式模型、工作负载对象、客户端工具、调度、kubelet 生命周期、运行时与 CRI（crictl / nerdctl / ctr）、网络模型、RBAC |
-| **L2** `l2-production` | 生产部署与组件选型 | 硬件拓扑、集群规划、容量计算器、节点 OS 基线、kubespray 部署与配置、组件选型总览、CNI、LB / Ingress / Gateway API、网络策略、PV/PVC/CSI、存储接入、PVC 闯关 |
+| **L2** `l2-production` | 生产部署与组件选型 | 硬件拓扑、集群规划、容量计算器、节点 OS 基线、kubespray 部署（含 group_vars 逐项拆解）、组件选型总览、CNI、LB / Ingress / Gateway API、网络策略、PV/PVC/CSI、存储接入、PVC 闯关 |
 | **L3** `l3-platform-ops` | 配套组件与日常运维 | 可观测性、镜像仓库、节点与控制面运维、升级、etcd 备份恢复、NotReady 闯关、多租户、规模化、值班手册 |
 | **L4** `l4-ai` | AI 场景：GPU、训练与推理 | GPU Operator 与拓扑、高性能网络（InfiniBand / RoCE）、AI 负载调度（Volcano / Kueue）、训练与推理平台（Trainer / Ray / vLLM） |
 
-共 5 个阶段 **39 节课，全部已完成正文**，其中动手环节 17 节（14 个实验 + 2 个命令行闯关 +
+共 5 个阶段 **38 节课，全部已完成正文**，其中动手环节 16 节（13 个实验 + 2 个命令行闯关 +
 1 个规划计算器），另有 1 个嵌在《控制面解剖》里的 apply 推演。正文含 72 个随堂检查点、
 178 个提示框、4 个命令行演练。
 
@@ -117,10 +118,10 @@ kubepath/
 │   │   ├── ClusterCapacityPlanner.tsx   # 集群容量计算器
 │   │   ├── mdx-components.tsx           # MDX 全局组件表
 │   │   └── lesson-context.ts            # 当前课程 key，供交互组件写进度
-│   ├── content/                 # 39 节课程正文
+│   ├── content/                 # 38 节课程正文
 │   │   ├── l0-container/        # 2 节
 │   │   ├── l1-basics/           # 10 节
-│   │   ├── l2-production/       # 13 节
+│   │   ├── l2-production/       # 12 节
 │   │   ├── l3-platform-ops/     # 10 节
 │   │   └── l4-ai/               # 4 节
 │   ├── routes/

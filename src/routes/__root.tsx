@@ -11,7 +11,7 @@ export const Route = createRootRoute({
       {
         name: 'description',
         content:
-          'Kubernetes 的在线交互式学习项目：一条从 Docker 容器、kind 集群、生产部署与组件选型、配套运维，一路走到 GPU 与 AI 负载调度的完整学习主线。',
+          'Kubernetes 工程师的成长路线：从跑起一个容器，到扛住一套 GPU 集群。按 Docker 容器与镜像、kind 上的对象与调度、生产部署与组件选型、配套组件与日常运维、GPU 与 AI 负载五个阶段循序渐进，配交互式检查点与命令行闯关。',
       },
     ],
     links: [

@@ -152,7 +152,7 @@ etcdserver: mvcc: database space exceeded
 
 ### 为什么会发生
 
-etcd 用 MVCC：每次对象的创建、更新、删除都产生一个新 revision，**历史版本会不断累积**。默认配额只有 2GB（见《把规划写进配置》），对象多、变更频繁的集群几个月就会撞上。
+etcd 用 MVCC：每次对象的创建、更新、删除都产生一个新 revision，**历史版本会不断累积**。默认配额只有 2GB（见《用 kubespray 装出第一套集群》），对象多、变更频繁的集群几个月就会撞上。
 
 一旦触发 NOSPACE alarm，etcd 进入维护模式：**只允许读和删除，拒绝所有写入**。表现是 apiserver 全面报错、Pod 调度不了、`kubectl apply` 全失败。
 

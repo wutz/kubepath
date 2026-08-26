@@ -68,7 +68,7 @@ kubectl get svc -A -o jsonpath='{.items[*].status.loadBalancer.ingress[*].ip}' \
 | **BGP** | 和交换机建邻居，宣告 VIP 路由 | 生产环境 | 需要网络团队配合分配 AS 号 |
 
 <Callout type="warn" title="L2 模式必须开 kube_proxy_strict_arp">
-这是 L2《把规划写进配置》里提前埋下的一项：
+这是 L2《用 kubespray 装出第一套集群》里提前埋下的一项：
 
 ```yaml
 kube_proxy_strict_arp: true
