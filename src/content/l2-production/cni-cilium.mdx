@@ -125,7 +125,7 @@ kubectl run -it --rm net --image=nicolaka/netshoot -- sh
 <Callout type="tip" title="cilium-dbg status 是排障第一站">
 它一次给出 IPAM 用量、数据面模式、kube-proxy 替换状态、以及各子系统的健康状况。
 
-尤其是 `IPAM: IPv4: 12/254 allocated` 这一行 —— **IP 池耗尽是 `FailedCreatePodSandBox` 的常见原因**（L0《运行时与 CRI》讲过这个报错指向 CNI）。看到 254/254 就知道要扩 CIDR 了。
+尤其是 `IPAM: IPv4: 12/254 allocated` 这一行 —— **IP 池耗尽是 `FailedCreatePodSandBox` 的常见原因**（L1《运行时与 CRI》讲过这个报错指向 CNI）。看到 254/254 就知道要扩 CIDR 了。
 </Callout>
 
 ## Pod CIDR 用尽了怎么办

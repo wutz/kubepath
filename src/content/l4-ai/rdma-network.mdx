@@ -1,0 +1,217 @@
+单机八卡的训练跑得很好，扩到四台机器三十二张卡，吞吐只涨了两倍多。这不是玄学 —— **多机训练的瓶颈几乎总在网络上**。
+
+原因是数据并行每一步都要做一次 all-reduce：把所有卡上的梯度加起来再分发回去。模型有多大，每步就要在网络上搬多少字节，每一步都搬。用普通以太网 TCP 跑这件事，GPU 会有很长时间在等网络。
+
+这一节把 RDMA 从物理层一路接到 Pod 里，最后用 NCCL 的实测带宽验收。
+
+## RDMA 快在哪
+
+普通 TCP 收一个包要经过：网卡中断 → 内核协议栈 → 拷贝到用户态缓冲区 → 应用读取。每一步都花 CPU，每一次拷贝都花内存带宽。
+
+RDMA（Remote Direct Memory Access）把这条路径整个绕开：
+
+| 维度 | TCP / 以太网 | RDMA |
+| --- | --- | --- |
+| 数据路径 | 应用 → 内核 → 网卡 | 应用 ↔ 网卡（**内核旁路**） |
+| 拷贝次数 | 至少两次 | **零拷贝**，网卡直接读写应用内存 |
+| CPU 占用 | 高，大流量能吃满几个核 | 接近零 |
+| 典型延迟 | 20–50 μs | **1–3 μs** |
+
+再叠加 **GPUDirect RDMA**：网卡直接读写 GPU 显存，连主机内存都不经过。一次 all-reduce 的路径从「显存 → 主存 → 内核 → 网卡」压缩成「显存 → 网卡」。
+
+<Callout type="note" title="为什么这件事只在训练里被反复提">
+推理服务的网络流量是请求/响应，几 KB 到几 MB，TCP 完全够用。
+
+训练不一样：一个 70B 模型做数据并行，每步 all-reduce 要同步上百 GB 的梯度，而一步只有几百毫秒。这时网络带宽直接换算成 GPU 空转时间 —— 卡越贵，空转越亏。
+
+所以判断要不要上 RDMA，看的不是「用不用 GPU」，而是**要不要做多机训练**。
+</Callout>
+
+## InfiniBand 与 RoCE：选哪个
+
+两条技术路线，跑的是同一套 RDMA 语义（verbs API 一致，NCCL 两边都认），差别在底下：
+
+| | InfiniBand | RoCEv2 |
+| --- | --- | --- |
+| 物理网络 | 专用 IB 交换机与线缆 | 标准以太网交换机（要支持 PFC/ECN） |
+| 无损保障 | 链路层信用机制，**天生无损** | 靠 PFC + ECN 配出来，配不对就丢包 |
+| 子网管理 | 需要 SM（opensm 或交换机内置） | 不需要，走普通 IP 路由 |
+| 运维 | 独立一套网络，团队要专门学 | 复用以太网知识与工具 |
+| 成本 | 高，交换机与线缆都是专用件 | 中，但网卡仍是专用的 |
+| 典型场景 | 大规模训练集群、追求极致确定性 | 已有以太网体系、规模中等、想复用运维 |
+
+一句话取舍：**从零建大规模训练集群、预算够 → IB；在现有以太网体系里加 GPU 集群 → RoCE**。
+
+<Callout type="trap" title="RoCE 最大的坑：无损网络没配对，性能不如 TCP">
+RoCEv2 假设网络不丢包。一旦丢包，RDMA 的重传代价远比 TCP 大 —— 早期实现是 go-back-N，丢一个包要重传一整个窗口。
+
+现象是：`ib_write_bw` 单链路测出来很漂亮，一上多机训练带宽就塌，而且抖动极大。根子往往在交换机侧：
+
+- **PFC 没开或优先级不匹配** —— 网卡打了 DSCP 46，交换机按别的队列调度，反压根本没生效
+- **ECN 阈值没调** —— 拥塞没被及早通告，等到丢包已经晚了
+- **中间某一跳是不支持 PFC 的普通交换机** —— 整条路径的无损保证就断在那一跳
+
+这件事必须和网络团队一起配，而且要端到端逐跳确认。RoCE 的「省钱」省的是交换机采购，不是运维投入。
+</Callout>
+
+## 节点侧：把网卡准备好
+
+```bash
+# 1. 驱动与用户态工具（MLNX_OFED 或发行版自带的 rdma-core）
+ofed_info -s
+rdma link show
+
+# 2. 看设备与端口状态
+ibstat
+# CA 'mlx5_0'
+#   Port 1: State: Active        ← 必须是 Active
+#           Physical state: LinkUp
+#           Rate: 400            ← 400Gb/s，和线缆、交换机端口都要匹配
+
+# 3. IB 组网还需要子网管理器在跑（交换机内置或某台机器上跑 opensm）
+sminfo
+
+# 4. 拓扑：GPU 和网卡是不是在同一个 NUMA / PCIe switch 下
+nvidia-smi topo -m
+```
+
+`nvidia-smi topo -m` 那张矩阵是这一节最该看懂的输出：
+
+```
+        GPU0  GPU1  GPU2  GPU3  NIC0  NIC1
+GPU0     X    NV18  NV18  NV18   PIX   SYS
+GPU1    NV18   X    NV18  NV18   PIX   SYS
+...
+Legend: NV# = NVLink，PIX = 同一 PCIe switch，SYS = 跨 NUMA 走 CPU 互联
+```
+
+**GPU 与它要用的网卡之间是 `PIX` 才理想，`SYS` 意味着数据要跨 NUMA 绕一圈** —— GPUDirect 的收益会被吃掉大半。八卡机通常配四张或八张网卡，就是为了让每张卡都能就近出网。
+
+<Callout type="warn" title="NUMA 绑错，带宽直接砍半">
+一台八卡机上，GPU 0–3 挂在 NUMA 0，GPU 4–7 挂在 NUMA 1，网卡同理。如果训练进程用 GPU 0 却走了 NUMA 1 上的网卡，每个字节都要多走一趟 CPU 之间的互联。
+
+实测表现：`nccl-tests` 的 busbw 只有理论值的一半左右，而 `ib_write_bw` 单测又是满的 —— 这个组合基本可以断定是拓扑绑定问题。
+
+解法是让 NCCL 自己按拓扑选网卡（`NCCL_TOPO_FILE`），或显式指定 `NCCL_IB_HCA` 并配合 CPU 绑核。
+</Callout>
+
+## 集群侧：把网卡接进 Pod
+
+Pod 默认只有一张 CNI 给的 eth0，拿不到 RDMA 设备。要接进去需要三个组件配合：
+
+| 组件 | 作用 |
+| --- | --- |
+| **Multus** | 让 Pod 能挂第二张网卡（业务网走 Cilium，RDMA 网走专用网卡） |
+| **SR-IOV Device Plugin** | 把网卡的 VF 切成可调度资源，比如 `nvidia.com/hostdev` |
+| **RDMA Shared Device Plugin** | 共享模式：多个 Pod 共用同一个 RDMA 设备，适合训练场景 |
+| **NVIDIA Network Operator** | 把上面这些打包成一套 CRD 部署，和 GPU Operator 是姊妹项目 |
+
+最省事的路径是 Network Operator + GPU Operator 配套装，然后在 Pod 里这样申请：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: train-worker
+  annotations:
+    k8s.v1.cni.cncf.io/networks: rdma-net      # Multus 挂第二张网卡
+spec:
+  containers:
+    - name: trainer
+      image: nvcr.io/nvidia/pytorch:24.12-py3
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+          rdma/rdma_shared_device_a: 1          # RDMA 设备
+      securityContext:
+        capabilities:
+          add: ["IPC_LOCK"]                     # RDMA 要锁页内存，少了它起不来
+```
+
+<Callout type="tip" title="IPC_LOCK 是最常见的一行漏配">
+RDMA 需要把内存页锁住不让换出，这要 `CAP_IPC_LOCK`。漏了它，容器里 `ibv_devinfo` 能看到设备，但一跑 NCCL 就报 `failed to register memory region`。
+
+配套还要放开 `ulimit -l`（memlock），生产上一般在 containerd 的默认 ulimit 里设成 unlimited。
+</Callout>
+
+## 验收：两层测试
+
+**第一层 —— 单链路裸带宽**，确认物理链路和驱动没问题：
+
+```bash
+# 服务端
+ib_write_bw -d mlx5_0 -a -F
+
+# 客户端
+ib_write_bw -d mlx5_0 -a -F <server-ip>
+# 400Gb/s 的网卡，65536 字节这一行应该跑到 45000+ MB/s
+```
+
+**第二层 —— 多机 NCCL 带宽**，这才是训练真正感受到的数字：
+
+```bash
+mpirun -np 32 -H node1:8,node2:8,node3:8,node4:8 \
+  -x NCCL_IB_HCA=mlx5 \
+  -x NCCL_DEBUG=INFO \
+  all_reduce_perf -b 8 -e 8G -f 2 -g 1
+```
+
+看两个东西：
+
+- **busbw** —— 总线带宽，大消息尺寸下应该接近网卡理论值的 80–90%
+- **`NCCL_DEBUG=INFO` 的日志** —— 它会打印实际选用的传输通道，出现 `via NET/Socket` 就说明**根本没走 RDMA**，应该是 `NET/IB`
+
+<Callout type="trap" title="NCCL 会静默退化到 TCP">
+RDMA 没配好时，NCCL 不会报错退出 —— 它会安静地退回 socket 传输，训练照跑，只是慢。
+
+于是「跑通了」和「跑对了」之间差着几倍性能，而且没有任何报错提醒你。所以每次改完网络配置，都要看一眼 `NCCL_DEBUG=INFO` 里的传输方式，别只看训练有没有起来。
+</Callout>
+
+## 常见故障与定位顺序
+
+| 现象 | 先查什么 |
+| --- | --- |
+| Pod 里看不到 RDMA 设备 | device plugin 是否上报资源、Pod 有没有申请、Multus 网络定义 |
+| `failed to register memory region` | `IPC_LOCK` 与 memlock ulimit |
+| NCCL 走了 Socket | `NCCL_IB_HCA` 是否指对、网卡端口是不是 Active、GID 选择 |
+| 单链路满速但多机带宽减半 | GPU/NIC 的 NUMA 亲和，看 `nvidia-smi topo -m` |
+| 带宽抖动、偶发骤降 | RoCE 的 PFC/ECN 配置，交换机侧逐跳确认 |
+| 规模越大越慢 | 交换机层级与超额订阅比（oversubscription），Rail-optimized 拓扑 |
+
+<Quiz
+  id="rdma-1"
+  question="四机三十二卡训练，ib_write_bw 单链路测出 45 GB/s（接近满速），但 nccl-tests 的 busbw 只有 22 GB/s。最该先查的是？"
+  options={[
+    {
+      text: 'GPU 与网卡的 NUMA / PCIe 亲和，看 nvidia-smi topo -m 是不是 SYS',
+      correct: true,
+    },
+    { text: '网卡速率协商错了，实际跑在 200Gb/s', feedback: '单链路已经测到 45 GB/s（约 360Gb/s），速率协商是对的。' },
+    { text: '交换机 PFC 没开', feedback: 'PFC 问题的典型表现是丢包导致的抖动和骤降，而不是稳定的「刚好一半」。' },
+    { text: 'NCCL 退化到了 Socket 传输', feedback: '走 Socket 的带宽通常只有几个 GB/s，掉到 22 GB/s 还远没那么惨 —— 不过这一项值得顺手用 NCCL_DEBUG=INFO 确认。' },
+  ]}
+  explain={<>「单链路满速 + 集合通信约一半」是跨 NUMA 的经典指纹：数据从 GPU 显存出发，要先跨 CPU 互联到另一个 NUMA 上的网卡，多绕的这一跳吃掉了一半带宽。先看 <code>nvidia-smi topo -m</code> 里 GPU 与 NIC 的关系，理想是 <code>PIX</code>，出现 <code>SYS</code> 就要用 <code>NCCL_IB_HCA</code> 或拓扑文件把每张卡绑到就近的网卡上。</>}
+/>
+
+<Quiz
+  id="rdma-2"
+  question="现有一套成熟的以太网体系和网络团队，要新建一个 32 节点的训练集群。关于 RoCE 的判断哪个最准确？"
+  options={[
+    {
+      text: '可以选 RoCE，但必须端到端配好 PFC/ECN —— 省的是交换机采购，不是运维投入',
+      correct: true,
+    },
+    { text: 'RoCE 跑在以太网上，插上网卡就能用，不需要额外配置', feedback: 'RoCEv2 依赖无损网络。不配 PFC/ECN 的话，一拥塞就丢包，重传代价比 TCP 还大。' },
+    { text: 'RoCE 性能天生比 IB 差一个档次，训练集群只能用 IB', feedback: '配置正确的 RoCE 与同速率 IB 在带宽上很接近，差别主要在极端规模下的确定性与运维模型。' },
+    { text: '既然有以太网，直接用 TCP 就行，RDMA 是过度设计', feedback: '32 节点做多机训练时，TCP 的 CPU 开销与延迟会让 GPU 大量空转，这笔账用卡时算很快就亏回来。' },
+  ]}
+  explain={<>RoCE 的价值是复用以太网的物理设施与运维工具链，代价是无损网络要自己配出来 —— PFC 优先级、ECN 阈值、每一跳交换机都要确认。这部分工作量不小，但对已有以太网体系的团队来说，比引入一整套 IB 网络（专用交换机、线缆、子网管理器、独立运维知识）更划算。</>}
+/>
+
+## 这一节留下的三个判断
+
+1. **要不要 RDMA，看要不要多机训练** —— 单机多卡走 NVLink，跨机才轮到网络
+2. **验收要看 NCCL 的 busbw，不是 ib_write_bw** —— 单链路满速说明不了集合通信的问题
+3. **NCCL 会静默退化** —— 每次改完配置都用 `NCCL_DEBUG=INFO` 确认走的是 `NET/IB`
+
+下一节《AI 负载调度》会用到这里的结论：多机训练任务必须整体起、整体停（gang scheduling），而任务落在哪几台机器上，也要考虑它们在网络拓扑里的位置。

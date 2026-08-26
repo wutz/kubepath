@@ -112,7 +112,7 @@ resources:
 3. **必须显式申请**
 
 <Callout type="trap" title="禁止用 NVIDIA_VISIBLE_DEVICES=all 绕过资源系统">
-L0《运行时与 CRI》讲过这个坑，这里给出制度化的解法。
+L1《运行时与 CRI》讲过这个坑，这里给出制度化的解法。
 
 不申请 `resources.limits.nvidia.com/gpu`、直接设 `NVIDIA_VISIBLE_DEVICES=all` 的 Pod 会有两个严重问题：
 

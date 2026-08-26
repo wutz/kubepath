@@ -13,8 +13,8 @@
 
 | 路线 | `?role=` | 面向 | 规模 |
 | --- | --- | --- | --- |
-| **解决方案架构师** | `architect` | 出方案、算规模、做选型对比，每个数字都得站得住 | 21 节 / 约 12 小时 |
-| **集群运维工程师** | `cluster-ops` | 不做裁剪的完整主线，L0→L4 按阶段通读 | 38 节 / 约 22 小时 |
+| **解决方案架构师** | `architect` | 出方案、算规模、做选型对比，每个数字都得站得住 | 22 节 / 约 13 小时 |
+| **集群运维工程师** | `cluster-ops` | 不做裁剪的完整主线，L0→L4 按阶段通读 | 39 节 / 约 23 小时 |
 | **存储运维工程师** | `storage-ops` | K8s 是后端存储的一个大客户，PVC 出事先找你 | 16 节 / 约 9 小时 |
 
 架构师与存储运维两条按裁剪过的分段清单渲染（连续编号 + 来源阶段徽标），集群运维那条是完整主线，
@@ -29,15 +29,15 @@
 
 | 阶段 | 主题 | 说明 |
 | --- | --- | --- |
-| **L0** `l0-container` | 容器与镜像 | 围绕 Docker：容器原理（namespace / cgroup / 镜像）、Docker 基础、运行时与 CRI |
-| **L1** `l1-basics` | K8s 基础与对象 | 围绕 kind：本地多节点集群、控制面解剖、声明式模型、工作负载对象、客户端工具、调度、kubelet 生命周期、网络模型、RBAC |
+| **L0** `l0-container` | 容器与镜像 | 围绕 Docker：容器原理（namespace / cgroup / 镜像）、Docker 基础 |
+| **L1** `l1-basics` | K8s 基础与对象 | 围绕 kind：本地多节点集群、控制面解剖、声明式模型、工作负载对象、客户端工具、调度、kubelet 生命周期、运行时与 CRI、网络模型、RBAC |
 | **L2** `l2-production` | 生产部署与组件选型 | 硬件拓扑、集群规划、容量计算器、节点 OS 基线、kubespray 部署与配置、组件选型总览、CNI、LB / Ingress / Gateway API、网络策略、PV/PVC/CSI、存储接入、PVC 闯关 |
 | **L3** `l3-platform-ops` | 配套组件与日常运维 | 可观测性、镜像仓库、节点与控制面运维、升级、etcd 备份恢复、NotReady 闯关、多租户、规模化、值班手册 |
-| **L4** `l4-ai` | AI 场景：GPU、训练与推理 | GPU Operator 与拓扑、AI 负载调度（Volcano / Kueue）、训练与推理平台（Trainer / Ray / vLLM） |
+| **L4** `l4-ai` | AI 场景：GPU、训练与推理 | GPU Operator 与拓扑、高性能网络（InfiniBand / RoCE）、AI 负载调度（Volcano / Kueue）、训练与推理平台（Trainer / Ray / vLLM） |
 
-共 5 个阶段 **38 节课，全部已完成正文**，其中动手环节 16 节（13 个实验 + 2 个命令行闯关 +
-1 个规划计算器），另有 1 个嵌在《控制面解剖》里的 apply 推演。正文含 69 个随堂检查点、
-169 个提示框、4 个命令行演练。
+共 5 个阶段 **39 节课，全部已完成正文**，其中动手环节 17 节（14 个实验 + 2 个命令行闯关 +
+1 个规划计算器），另有 1 个嵌在《控制面解剖》里的 apply 推演。正文含 71 个随堂检查点、
+174 个提示框、4 个命令行演练。
 
 线上地址：<https://kubepath.wutz.dev>
 
@@ -128,12 +128,12 @@ kubepath/
 │   │   ├── ClusterCapacityPlanner.tsx   # 集群容量计算器
 │   │   ├── mdx-components.tsx           # MDX 全局组件表
 │   │   └── lesson-context.ts            # 当前课程 key，供交互组件写进度
-│   ├── content/                 # 38 节课程正文
-│   │   ├── l0-container/        # 3 节
-│   │   ├── l1-basics/           # 9 节
+│   ├── content/                 # 39 节课程正文
+│   │   ├── l0-container/        # 2 节
+│   │   ├── l1-basics/           # 10 节
 │   │   ├── l2-production/       # 13 节
 │   │   ├── l3-platform-ops/     # 10 节
-│   │   └── l4-ai/               # 3 节
+│   │   └── l4-ai/               # 4 节
 │   ├── routes/
 │   │   ├── __root.tsx
 │   │   ├── index.tsx                    # 首页：岗位路线选择 + 路线目录 + 进度

@@ -89,7 +89,7 @@ export const roles: Role[] = [
       {
         title: 'AI 场景要多算的那几笔',
         hint: 'GPU 集群的方案里，卡不是唯一贵的东西',
-        lessons: ['l4-ai/gpu-operator', 'l4-ai/ai-scheduling'],
+        lessons: ['l4-ai/gpu-operator', 'l4-ai/rdma-network', 'l4-ai/ai-scheduling'],
       },
       {
         title: '交付前要想清楚的事',
@@ -132,11 +132,7 @@ export const roles: Role[] = [
       {
         title: '先看懂容器与节点',
         hint: '存储最终挂在节点上，先知道那台机器上发生了什么',
-        lessons: [
-          'l0-container/container-runtime',
-          'l0-container/docker-basics',
-          'l0-container/containerd-cri',
-        ],
+        lessons: ['l0-container/container-runtime', 'l0-container/docker-basics'],
       },
       {
         title: '够用的 K8s 心智模型',
@@ -148,6 +144,7 @@ export const roles: Role[] = [
           'l1-basics/declarative',
           'l1-basics/api-objects',
           'l1-basics/kubelet-lifecycle',
+          'l1-basics/containerd-cri',
         ],
       },
       {

@@ -76,7 +76,7 @@ export const tracks: Track[] = [
     level: 'L0',
     title: '容器与镜像',
     subtitle: '围绕 Docker 打底',
-    goal: 'K8s 调度的是容器，排障排到最后也是容器。这一阶段用 Docker 把底座打牢：容器在内核里到底是什么、镜像怎么构建才不坑人、运行时和 kubelet 之间那条链路长什么样。',
+    goal: 'K8s 调度的是容器，排障排到最后也是容器。这一阶段用 Docker 把底座打牢：容器在内核里到底是什么、镜像怎么构建才不坑人 —— 这两件事想明白了，后面所有的现象才解释得通。',
     lessons: [
       {
         id: 'container-runtime',
@@ -121,27 +121,6 @@ export const tracks: Track[] = [
         ],
         refs: [REF_DOCKER, repo('k8s/faq.md')],
       },
-      {
-        id: 'containerd-cri',
-        title: '运行时与 CRI：kubelet 底下发生了什么',
-        summary: 'kubelet 自己不会跑容器，它通过 CRI 指挥 containerd。这条链路断在哪，节点就 NotReady 在哪。',
-        kind: 'concept',
-        status: 'ready',
-        minutes: 30,
-        objectives: [
-          '画出 kubelet → CRI → containerd → runc 的完整调用链',
-          '用 crictl 直接排查 kubectl 看不到的容器状态',
-          '解释 pause 容器的作用，以及 Pod 内容器为什么能共享网络',
-        ],
-        outline: [
-          'CRI 接口：RuntimeService 与 ImageService',
-          'containerd 的架构与 namespace（k8s.io）',
-          'pause 容器与 Pod sandbox',
-          'crictl 常用命令：ps / inspect / logs / imagefs',
-          '镜像拉取失败的四类原因与定位顺序',
-        ],
-        refs: [repo('k8s/faq.md'), REF_UPSTREAM],
-      },
     ],
   },
   {
@@ -149,7 +128,7 @@ export const tracks: Track[] = [
     level: 'L1',
     title: 'K8s 基础与对象',
     subtitle: '在 kind 集群上边做边学',
-    goal: '第一节用 kind 在本机起一套多节点集群，后面几节的每条命令都在这套集群上跑得动 —— 对象、控制器、调度、网络、权限，先摸熟了，再谈把它装到生产机器上。',
+    goal: '第一节用 kind 在本机起一套多节点集群，后面几节的每条命令都在这套集群上跑得动 —— 对象、控制器、调度、kubelet 与它底下的运行时、网络、权限，先摸熟了，再谈把它装到生产机器上。',
     lessons: [
       {
         id: 'kind-cluster',
@@ -304,6 +283,27 @@ export const tracks: Track[] = [
           '按状态选排查入口的对照表',
         ],
         refs: [REF_UPSTREAM],
+      },
+      {
+        id: 'containerd-cri',
+        title: '运行时与 CRI：kubelet 底下发生了什么',
+        summary: 'kubelet 自己不会跑容器，它通过 CRI 指挥 containerd。这条链路断在哪，节点就 NotReady 在哪。',
+        kind: 'concept',
+        status: 'ready',
+        minutes: 30,
+        objectives: [
+          '画出 kubelet → CRI → containerd → runc 的完整调用链',
+          '用 crictl 直接排查 kubectl 看不到的容器状态',
+          '解释 pause 容器的作用，以及 Pod 内容器为什么能共享网络',
+        ],
+        outline: [
+          'CRI 接口：RuntimeService 与 ImageService',
+          'containerd 的架构与 namespace（k8s.io）',
+          'pause 容器与 Pod sandbox',
+          'crictl 常用命令：ps / inspect / logs / imagefs',
+          '镜像拉取失败的四类原因与定位顺序',
+        ],
+        refs: [repo('k8s/faq.md'), REF_UPSTREAM],
       },
       {
         id: 'networking-model',
@@ -881,8 +881,8 @@ export const tracks: Track[] = [
     id: 'l4-ai',
     level: 'L4',
     title: 'AI 场景：GPU、训练与推理',
-    subtitle: '把集群改造成 AI 平台',
-    goal: '通用集群离 AI 平台还差三层：GPU 节点要被正确识别与拓扑感知，训练任务要 gang scheduling 与配额，推理服务要显存与弹性。这一阶段把这三层补齐。',
+    subtitle: 'GPU、RDMA、训练与推理',
+    goal: '通用集群离 AI 平台还差四层：GPU 节点要被正确识别与拓扑感知，多机训练要 RDMA 把卡之间的带宽喂饱，训练任务要 gang scheduling 与配额，推理服务要显存与弹性。这一阶段把这四层补齐。',
     lessons: [
       {
         id: 'gpu-operator',
@@ -905,6 +905,28 @@ export const tracks: Track[] = [
           '常见故障：驱动版本、运行时配置、资源不可见',
         ],
         refs: [repo('ai/gpu-operator/README.md'), repo('base/nfd/README.md')],
+      },
+      {
+        id: 'rdma-network',
+        title: '高性能网络：InfiniBand 与 RoCE',
+        summary: '多机训练慢下来，一半以上的原因在网络。这一节把 RDMA 从物理层接到 Pod 里，并验到 NCCL 带宽上。',
+        kind: 'lab',
+        status: 'ready',
+        minutes: 40,
+        objectives: [
+          '说清 RDMA 相对 TCP 快在哪，以及 IB 与 RoCE 各自的适用面与代价',
+          '用 Network Operator + SR-IOV / Multus 把 RDMA 网卡接进 Pod',
+          '用 ib_write_bw 与 nccl-tests 验收带宽，判断瓶颈在网络还是在拓扑',
+        ],
+        outline: [
+          'RDMA 为什么快：内核旁路、零拷贝与 GPUDirect',
+          'InfiniBand 与 RoCEv2：交换机、无损网络与运维成本',
+          '节点侧：驱动、子网管理器、PFC / ECN 与 NUMA 亲和',
+          '集群侧：Network Operator、SR-IOV 设备插件与 Multus 第二张网卡',
+          '验收：ib_write_bw 单链路与 nccl-tests all_reduce 多机带宽',
+          '常见故障：带宽只有一半、丢包重传与 GID 选错',
+        ],
+        refs: [REF_NETPATH, REF_UPSTREAM],
       },
       {
         id: 'ai-scheduling',

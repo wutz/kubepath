@@ -58,7 +58,7 @@ Pod sandbox（pause 容器）
   容器 A    容器 B    initContainer
 ```
 
-这解释了 L0 第一节留下的那个问题：同 Pod 内的容器为什么能 `localhost` 互访 —— 它们 join 了同一个 pause 容器的 network namespace。也解释了为什么**业务容器反复重启，Pod IP 却不变**：IP 属于 sandbox，业务容器重启不重建 sandbox。
+这解释了 L0《容器到底是什么》留下的那个问题：同 Pod 内的容器为什么能 `localhost` 互访 —— 它们 join 了同一个 pause 容器的 network namespace。也解释了为什么**业务容器反复重启，Pod IP 却不变**：IP 属于 sandbox，业务容器重启不重建 sandbox。
 
 <Callout type="warn" title="sandbox 没起来，看的地方不一样">
 `kubectl describe pod` 里如果看到 `FailedCreatePodSandBox`，那问题在 **CNI**，不在你的镜像或命令 —— sandbox 的网络是 CNI 插件配的。
