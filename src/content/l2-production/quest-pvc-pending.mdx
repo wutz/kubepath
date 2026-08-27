@@ -4,7 +4,7 @@
 
 ## 开始之前：先想清楚在哪一侧
 
-上一节的分界线在这里要用上：
+《PV、PVC、StorageClass 与 CSI》里那条分界线，在这里要用上：
 
 - **PVC `Pending`** → 卷还没被创建出来 → 看 **controller** 侧的 provisioner
 - **PVC `Bound`，Pod `ContainerCreating`** → 卷有了但挂不上 → 看**那台节点**的 node plugin

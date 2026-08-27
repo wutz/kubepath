@@ -217,7 +217,7 @@ kubepath-worker2         kindest/node:v1.32.0   Up 2 minutes`,
     {
       cmd: 'kubectl get pods -n kube-system',
       goal: '看看这套集群里都跑了什么',
-      hint: '控制面组件都是静态 Pod，下一节《控制面解剖》会逐个拆。',
+      hint: '控制面组件都是静态 Pod，本阶段后面的《控制面解剖》会逐个拆。',
       output: `NAME                                             READY   STATUS    RESTARTS   AGE
 coredns-668d6bf9bc-4x8vq                         1/1     Running   0          2m
 etcd-kubepath-control-plane                      1/1     Running   0          2m

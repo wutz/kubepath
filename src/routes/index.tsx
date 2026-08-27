@@ -29,9 +29,9 @@ function Home() {
         <h1 className="display-2xl mt-3">从跑起一个容器，到扛住一套 GPU 集群。</h1>
         <p className="text-body mt-4 max-w-2xl text-[17px] leading-relaxed">
           K8s 的难不在命令多，而在每个现象背后都压着好几层：容器、运行时、控制面、网络、存储。
-          这条成长路线按真实的成长顺序排：先用 Docker 把容器与镜像吃透，再在本机的 kind
-          集群上摸熟对象与调度，然后把集群装到真机上并逐层选型，接上观测与仓库、扛过升级与故障，
-          最后走进 GPU、训练与推理。{stats.lessonCount} 节课，一节一节往上走。
+          每个阶段都按同一个节奏走：先把概念讲清楚，再动手做一遍，最后才拆开底下的原理。
+          从 Docker 与容器起步，到本机 kind 集群上的对象与调度，再到真机部署与逐层选型、
+          观测与日常运维，最后走进 GPU、训练与推理。{stats.lessonCount} 节课，一节一节往上走。
         </p>
       </section>
 
